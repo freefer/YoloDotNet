@@ -23,6 +23,9 @@ namespace YoloDotNet.ExecutionProvider.Cuda
         private List<string> _outputNames = default!;
         private int _dataTypeSize;
         private TensorElementType _elementDataType = default!;
+        private ModelType? _modelTypeOverride;
+        private ModelVersion? _modelVersionOverride;
+        private string[]? _labelsOverride;
 
         private IDisposableReadOnlyCollection<OrtValue>? _currentResult;
 
@@ -38,8 +41,17 @@ namespace YoloDotNet.ExecutionProvider.Cuda
         /// <param name="model"></param>
         /// <param name="gpuId"></param>
         /// <param name="trtConfig"></param>
-        public CudaExecutionProvider(string model, int gpuId = 0, TensorRt? trtConfig = null)
+        public CudaExecutionProvider(
+            string model,
+            int gpuId = 0,
+            TensorRt? trtConfig = null,
+            ModelType? modelType = null,
+            ModelVersion? modelVersion = null,
+            string[]? labels = null)
         {
+            _modelTypeOverride = modelType;
+            _modelVersionOverride = modelVersion;
+            _labelsOverride = labels;
             InitializeYolo(model, gpuId, trtConfig);
         }
 
@@ -49,8 +61,17 @@ namespace YoloDotNet.ExecutionProvider.Cuda
         /// <param name="model"></param>
         /// <param name="gpuId"></param>
         /// <param name="trtConfig"></param>
-        public CudaExecutionProvider(byte[] model, int gpuId = 0, TensorRt? trtConfig = null)
+        public CudaExecutionProvider(
+            byte[] model,
+            int gpuId = 0,
+            TensorRt? trtConfig = null,
+            ModelType? modelType = null,
+            ModelVersion? modelVersion = null,
+            string[]? labels = null)
         {
+            _modelTypeOverride = modelType;
+            _modelVersionOverride = modelVersion;
+            _labelsOverride = labels;
             InitializeYolo(model, gpuId, trtConfig);
         }
         #endregion
@@ -321,7 +342,7 @@ namespace YoloDotNet.ExecutionProvider.Cuda
         /// Extracts metadata and input/output shapes from the ONNX model.
         /// </summary>
         private void GetOnnxMetaData()
-            => OnnxData = _session.ParseOnnx();
+            => OnnxData = _session.ParseOnnx(_modelTypeOverride, _modelVersionOverride, _labelsOverride);
 
         public void Dispose()
         {

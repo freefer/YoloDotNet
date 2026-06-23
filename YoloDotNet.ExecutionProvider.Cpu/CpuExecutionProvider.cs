@@ -22,6 +22,9 @@ namespace YoloDotNet.ExecutionProvider.Cpu
         private List<string> _outputNames = default!;
         private int _dataTypeSize;
         private TensorElementType _elementDataType = default!;
+        private ModelType? _modelTypeOverride;
+        private ModelVersion? _modelVersionOverride;
+        private string[]? _labelsOverride;
 
         private IDisposableReadOnlyCollection<OrtValue>? _currentResult;
         #endregion
@@ -31,8 +34,15 @@ namespace YoloDotNet.ExecutionProvider.Cpu
         /// Constructs a CpuExecutionProvider for running ONNX models on the CPU.
         /// </summary>
         /// <param name="model"></param>
-        public CpuExecutionProvider(string model)
+        public CpuExecutionProvider(
+            string model,
+            ModelType? modelType = null,
+            ModelVersion? modelVersion = null,
+            string[]? labels = null)
         {
+            _modelTypeOverride = modelType;
+            _modelVersionOverride = modelVersion;
+            _labelsOverride = labels;
             InitializeYolo(model);
         }
 
@@ -40,8 +50,15 @@ namespace YoloDotNet.ExecutionProvider.Cpu
         /// Constructs a CpuExecutionProvider for running ONNX models on the CPU.
         /// </summary>
         /// <param name="model"></param>
-        public CpuExecutionProvider(byte[] model)
+        public CpuExecutionProvider(
+            byte[] model,
+            ModelType? modelType = null,
+            ModelVersion? modelVersion = null,
+            string[]? labels = null)
         {
+            _modelTypeOverride = modelType;
+            _modelVersionOverride = modelVersion;
+            _labelsOverride = labels;
             InitializeYolo(model);
         }
         #endregion
@@ -237,7 +254,7 @@ namespace YoloDotNet.ExecutionProvider.Cpu
         /// Extracts metadata and input/output shapes from the ONNX model.
         /// </summary>
         private void GetOnnxMetaData()
-            => OnnxData = _session.ParseOnnx();
+            => OnnxData = _session.ParseOnnx(_modelTypeOverride, _modelVersionOverride, _labelsOverride);
 
         /// <summary>
         /// Gets the tensor element type used by the model (e.g., Float32 or Float16).

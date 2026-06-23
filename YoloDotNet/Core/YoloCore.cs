@@ -75,7 +75,7 @@ namespace YoloDotNet.Core
 
                         try
                         {
-                            pinnedBuffer.Pointer.NormalizePixelsToArray(_inputShape, _inputShapeSize, pixelBuffer);
+                            pinnedBuffer.Pointer.NormalizePixelsToArray(_inputShape, _inputShapeSize, pixelBuffer, YoloOptions.ImageMean, YoloOptions.ImageStd);
                             inferenceResult = YoloOptions.ExecutionProvider.Run<ushort>(pixelBuffer);
                         }
                         finally
@@ -89,7 +89,7 @@ namespace YoloDotNet.Core
 
                         try
                         {
-                            pinnedBuffer.Pointer.NormalizePixelsToArray(_inputShape, _inputShapeSize, pixelBuffer);
+                            pinnedBuffer.Pointer.NormalizePixelsToArray(_inputShape, _inputShapeSize, pixelBuffer, YoloOptions.ImageMean, YoloOptions.ImageStd);
                             inferenceResult = YoloOptions.ExecutionProvider.Run<float>(pixelBuffer);
                         }
                         finally

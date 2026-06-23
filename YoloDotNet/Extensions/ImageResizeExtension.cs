@@ -142,7 +142,9 @@ namespace YoloDotNet.Extensions
         unsafe public static void NormalizePixelsToArray(this IntPtr pixelsPtr,
             long[] inputShape,
             int tensorBufferSize,
-            float[] tensorArrayBuffer)
+            float[] tensorArrayBuffer,
+            float[]? mean = null,
+            float[]? std = null)
         {
             var colorChannels = (int)inputShape[1];
             var height = (int)inputShape[2];
@@ -151,6 +153,7 @@ namespace YoloDotNet.Extensions
 
             float inv255 = 1.0f / 255.0f;
             byte* src = (byte*)pixelsPtr;
+            var useMeanStd = mean?.Length >= 3 && std?.Length >= 3;
 
             if (colorChannels == 1)
             {
@@ -160,7 +163,8 @@ namespace YoloDotNet.Extensions
                 for (int i = 0; i < totalPixels; i++, srcIndex += 4)
                 {
                     // Read only the grayscale component (assumed in R channel)
-                    dst[i] = src[srcIndex] * inv255;
+                    var value = src[srcIndex] * inv255;
+                    dst[i] = useMeanStd ? (value - mean![0]) / std![0] : value;
             }
             }
             else
@@ -172,9 +176,13 @@ namespace YoloDotNet.Extensions
                 int srcIndex = 0;
                 for (int i = 0; i < totalPixels; i++, srcIndex += 4)
         {
-                    dstR[i] = src[srcIndex] * inv255;
-                    dstG[i] = src[srcIndex + 1] * inv255;
-                    dstB[i] = src[srcIndex + 2] * inv255;
+                    var r = src[srcIndex] * inv255;
+                    var g = src[srcIndex + 1] * inv255;
+                    var b = src[srcIndex + 2] * inv255;
+
+                    dstR[i] = useMeanStd ? (r - mean![0]) / std![0] : r;
+                    dstG[i] = useMeanStd ? (g - mean![1]) / std![1] : g;
+                    dstB[i] = useMeanStd ? (b - mean![2]) / std![2] : b;
             }
             }
         }
@@ -190,7 +198,9 @@ namespace YoloDotNet.Extensions
         unsafe public static void NormalizePixelsToArray(this IntPtr pixelsPtr,
             long[] inputShape,
             int tensorBufferSize,
-            ushort[] tensorArrayBuffer)
+            ushort[] tensorArrayBuffer,
+            float[]? mean = null,
+            float[]? std = null)
         {
             var colorChannels = (int)inputShape[1];
             var height = (int)inputShape[2];
@@ -199,6 +209,7 @@ namespace YoloDotNet.Extensions
 
             float inv255 = 1.0f / 255.0f;
             byte* src = (byte*)pixelsPtr;
+            var useMeanStd = mean?.Length >= 3 && std?.Length >= 3;
 
             if (colorChannels == 1)
             {
@@ -207,7 +218,8 @@ namespace YoloDotNet.Extensions
 
                 for (int i = 0; i < totalPixels; i++, srcIndex += 4)
                 {
-                    dst[i] = FloatToUshort(src[srcIndex] * inv255);
+                    var value = src[srcIndex] * inv255;
+                    dst[i] = FloatToUshort(useMeanStd ? (value - mean![0]) / std![0] : value);
                 }
             }
             else
@@ -219,9 +231,13 @@ namespace YoloDotNet.Extensions
                 int srcIndex = 0;
                 for (int i = 0; i < totalPixels; i++, srcIndex += 4)
                 {
-                    dstR[i] = FloatToUshort(src[srcIndex] * inv255);
-                    dstG[i] = FloatToUshort(src[srcIndex + 1] * inv255);
-                    dstB[i] = FloatToUshort(src[srcIndex + 2] * inv255);
+                    var r = src[srcIndex] * inv255;
+                    var g = src[srcIndex + 1] * inv255;
+                    var b = src[srcIndex + 2] * inv255;
+
+                    dstR[i] = FloatToUshort(useMeanStd ? (r - mean![0]) / std![0] : r);
+                    dstG[i] = FloatToUshort(useMeanStd ? (g - mean![1]) / std![1] : g);
+                    dstB[i] = FloatToUshort(useMeanStd ? (b - mean![2]) / std![2] : b);
                 }
             }
         }
