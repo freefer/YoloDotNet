@@ -235,7 +235,9 @@ namespace YoloDotNet.Extensions
                 return GetModelType(modelType);
 
             if (IsRfdetrOutput(outputs))
-                return ModelType.ObjectDetection;
+                return IsRfdetrSegmentationOutput(outputs)
+                    ? ModelType.Segmentation
+                    : ModelType.ObjectDetection;
 
             throw new YoloDotNetModelException("Unsupported task");
         }
@@ -302,10 +304,15 @@ namespace YoloDotNet.Extensions
         };
 
         private static bool IsRfdetrOutput(Dictionary<string, int[]> outputs)
-            => outputs.Count == 2
+            => (outputs.Count == 2 || outputs.Count == 3)
                && outputs.ContainsKey("dets")
                && outputs.ContainsKey("labels")
                && outputs["dets"] is [_, _, 4];
+
+        private static bool IsRfdetrSegmentationOutput(Dictionary<string, int[]> outputs)
+            => IsRfdetrOutput(outputs)
+               && outputs.ContainsKey("masks")
+               && outputs["masks"].Length == 4;
 
         private static int? TryGetRfdetrClassCount(Dictionary<string, int[]> outputs)
             => IsRfdetrOutput(outputs) && outputs["labels"].Length == 3

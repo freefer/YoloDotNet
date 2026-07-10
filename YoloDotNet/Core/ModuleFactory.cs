@@ -129,7 +129,7 @@ namespace YoloDotNet.Core
                     { ModelType.Classification, core => throw new NotImplementedException() },
                     { ModelType.ObjectDetection, core => new ObjectDetectionModuleRFDETR(core) },
                     { ModelType.ObbDetection, core => throw new NotImplementedException() },
-                    { ModelType.Segmentation, core => throw new NotImplementedException() },
+                    { ModelType.Segmentation, core => new SegmentationModuleRFDETR(core) },
                     { ModelType.PoseEstimation, core => throw new NotImplementedException() }
                 }
             }
