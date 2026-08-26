@@ -5,24 +5,30 @@
 using SkiaSharp;
 using System.Diagnostics;
 using System.Globalization;
+using System.Text.Json;
 using YoloDotNet;
 using YoloDotNet.Enums;
-using YoloDotNet.ExecutionProvider.Cpu;
+using YoloDotNet.ExecutionProvider.Cuda;
+using YoloDotNet.ExecutionProvider.Cuda.TensorRT;
 using YoloDotNet.Extensions;
 using YoloDotNet.Models;
 using YoloDotNet.Test.Common;
-using YoloDotNet.Test.Common.Enums;
 
 namespace RFDETRNanoDemo
 {
     /// <summary>
-    /// Demonstrates RF-DETR Nano object detection on a static image.
+    /// Demonstrates RF-DETR inference with CUDA + TensorRT FP16,
+    /// timing each image under test/assets.
     /// </summary>
     internal class Program
     {
         private static string _outputFolder = default!;
+        private static string _trtEngineCacheFolder = default!;
         private static DetectionDrawingOptions _detectionDrawingOptions = default!;
         private static SegmentationDrawingOptions _segmentationDrawingOptions = default!;
+
+        private const int WarmupRuns = 2;
+        private static readonly string[] ImageExtensions = [".jpg", ".jpeg", ".png", ".bmp", ".webp"];
 
         static void Main(string[] args)
         {
@@ -30,22 +36,51 @@ namespace RFDETRNanoDemo
             SetDrawingOptions();
 
             var runSegmentation = true;
-            var modelPath = Path.Join(SharedConfig.ModelsFolder, runSegmentation ? "rfdetr-stain.onnx" : "rfdetr-nano.onnx");
-            var classNamesPath = Path.Join(SharedConfig.ModelsFolder, runSegmentation? "rfdetr-stain-class_names.txt" : "rfdetr-nano-class_names.txt");
+            var modelPath = Path.Join(SharedConfig.ModelsFolder,  "fabric.defects.seg.coco.v2-segmentation-2026-07-23.onnx");
+            var classNamesPath = Path.Join(SharedConfig.ModelsFolder, "fabric.defects.seg.coco.v2-segmentation-2026-07-23.txt");
 
-            if (EnsureDemoAssets(modelPath, classNamesPath, runSegmentation) is false)
+            if (EnsureDemoAssets(modelPath, classNamesPath, true) is false)
                 return;
+
+            var imagePaths = CollectTestImages();
+            if (imagePaths.Count == 0)
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"No images found under: {GetPreferredImageFolder()}");
+                Console.ForegroundColor = ConsoleColor.Gray;
+                return;
+            }
+
+            Console.WriteLine("Loading or building TensorRT FP16 engine cache...\n" +
+                "- Existing compatible cache will be reused automatically.\n" +
+                "- First build may take several minutes for RF-DETR Seg Medium.\n" +
+                $"- Cache directory: {_trtEngineCacheFolder}\n");
 
             using var yolo = new Yolo(new YoloOptions
             {
-                ExecutionProvider = new CpuExecutionProvider(
+                ExecutionProvider = new CudaExecutionProvider(
                     model: modelPath,
-                    modelType: runSegmentation ? ModelType.Segmentation : ModelType.ObjectDetection,
+                    gpuId: 0,
+                    trtConfig: new TensorRt
+                    {
+                        Precision = TrtPrecision.FP16,
+                        BuilderOptimizationLevel = 3,
+                        EngineCachePath = _trtEngineCacheFolder,
+                        EngineCachePrefix =    "fabric.defects.seg.coco.v2-segmentation-2026-07-23" ,
+                        Int8CalibrationCacheFile = Path.Join(SharedConfig.AbsoluteAssetsPath, "cache", "fabric.defects.seg.coco.v2-segmentation-2026-07-23.cache"),
+                    },
+                    modelType:     ModelType.Segmentation ,
                     modelVersion: ModelVersion.RFDETR,
                     labels: LoadLabels(classNamesPath)),
 
                 ImageResize = ImageResize.Stretched,
-                SamplingOptions = new(SKFilterMode.Linear, SKMipmapMode.None),
+                // Source photos here are large (e.g. ~3072x4096) and get downscaled ~7-9x to the
+                // model's 432x432 input. Plain bilinear without mipmapping aliases badly on
+                // high-frequency fabric weave texture at that reduction ratio, which was flipping
+                // classification on ambiguous defects (e.g. "yellowish stain" being misread as
+                // "dragging filth"). Enabling mipmapping fixes the aliasing and matches PIL/
+                // torchvision's higher-quality downscale used by the official rfdetr Python path.
+                SamplingOptions = new(SKFilterMode.Linear, SKMipmapMode.Linear),
 
                 // RF-DETR uses ImageNet normalization after scaling RGB values to 0..1.
                 ImageMean = [0.485f, 0.456f, 0.406f],
@@ -53,46 +88,138 @@ namespace RFDETRNanoDemo
             });
 
             Console.WriteLine($"Loaded ONNX Model: {yolo.ModelInfo}");
+            Console.WriteLine($"Test images: {imagePaths.Count} from {GetPreferredImageFolder()}");
+            Console.WriteLine();
 
-            using var image = SKBitmap.Decode(SharedConfig.GetTestImage(ImageType.ObjectDetection));
+            Warmup(yolo, imagePaths[0], runSegmentation);
 
-            if (runSegmentation)
-                RunSegmentationTest(yolo, image);
-            else
-                RunObjectDetectionTest(yolo, image);
+            var timingsMs = new List<double>(imagePaths.Count);
 
+            for (var i = 0; i < imagePaths.Count; i++)
+            {
+                var imagePath = imagePaths[i];
+                using var image = SKBitmap.Decode(imagePath);
+                if (image is null)
+                {
+                    Console.WriteLine($"[{i + 1}/{imagePaths.Count}] skip (decode failed): {Path.GetFileName(imagePath)}");
+                    continue;
+                }
+
+                var sw = Stopwatch.StartNew();
+                if (runSegmentation)
+                {
+                    var results = yolo.RunSegmentation(image, confidence: 0.2, pixelConfedence: 0.5, iou: 0.7);
+                    sw.Stop();
+
+                    timingsMs.Add(sw.Elapsed.TotalMilliseconds);
+                    SaveSegmentationResult(image, results, imagePath);
+                    PrintImageResult(i + 1, imagePaths.Count, imagePath, results.Count, sw.Elapsed.TotalMilliseconds);
+                }
+                else
+                {
+                    var results = yolo.RunObjectDetection(image, confidence: 0.2, iou: 0.7);
+                    sw.Stop();
+
+                    timingsMs.Add(sw.Elapsed.TotalMilliseconds);
+                    SaveObjectDetectionResult(image, results, imagePath);
+                    PrintImageResult(i + 1, imagePaths.Count, imagePath, results.Count, sw.Elapsed.TotalMilliseconds);
+                }
+            }
+
+            PrintTimingSummary(timingsMs);
             DisplayOutputFolder();
         }
 
-        private static void RunObjectDetectionTest(Yolo yolo, SKBitmap image)
+        private static void Warmup(Yolo yolo, string imagePath, bool runSegmentation)
         {
-            var results = yolo.RunObjectDetection(image, confidence: 0.4, iou: 0.7);
+            using var image = SKBitmap.Decode(imagePath);
+            if (image is null)
+                return;
 
-            image.Draw(results, _detectionDrawingOptions);
+            Console.WriteLine($"Warmup x{WarmupRuns} on {Path.GetFileName(imagePath)}...");
+            for (var i = 0; i < WarmupRuns; i++)
+            {
+                if (runSegmentation)
+                    _ = yolo.RunSegmentation(image, confidence: 0.4, pixelConfedence: 0.5, iou: 0.7);
+                else
+                    _ = yolo.RunObjectDetection(image, confidence: 0.4, iou: 0.7);
+            }
 
-            var fileName = Path.Combine(_outputFolder, "RFDETRNanoObjectDetection.jpg");
-            image.Save(fileName, SKEncodedImageFormat.Jpeg, 80);
-
-            PrintResults(results);
+            Console.WriteLine("Warmup done.\n");
         }
 
-        private static void RunSegmentationTest(Yolo yolo, SKBitmap image)
+        private static string GetPreferredImageFolder()
         {
-            var results = yolo.RunSegmentation(image, confidence: 0.4, pixelConfedence: 0.5, iou: 0.7);
+            var testFolder = Path.Join(SharedConfig.AbsoluteAssetsPath, "Test");
+            if (Directory.Exists(testFolder))
+                return testFolder;
 
+            return SharedConfig.MediaFolder;
+        }
+
+        private static List<string> CollectTestImages()
+        {
+            var folder = GetPreferredImageFolder();
+            if (Directory.Exists(folder) is false)
+                return [];
+
+            return Directory
+                .EnumerateFiles(folder, "*.*", SearchOption.TopDirectoryOnly)
+                .Where(path => ImageExtensions.Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase))
+                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        private static void SaveSegmentationResult(SKBitmap image, List<Segmentation> results, string imagePath)
+        {
             image.Draw(results, _segmentationDrawingOptions);
-
-            var fileName = Path.Combine(_outputFolder, "RFDETRNanoSegmentation.jpg");
+            var fileName = Path.Combine(_outputFolder, $"seg_{Path.GetFileNameWithoutExtension(imagePath)}.jpg");
             image.Save(fileName, SKEncodedImageFormat.Jpeg, 80);
-
-            PrintResults(results);
         }
 
-        private static string[] LoadLabels(string path)
+        private static void SaveObjectDetectionResult(SKBitmap image, List<ObjectDetection> results, string imagePath)
+        {
+            image.Draw(results, _detectionDrawingOptions);
+            var fileName = Path.Combine(_outputFolder, $"det_{Path.GetFileNameWithoutExtension(imagePath)}.jpg");
+            image.Save(fileName, SKEncodedImageFormat.Jpeg, 80);
+        }
+
+        private static void PrintImageResult(int index, int total, string imagePath, int detectionCount, double elapsedMs)
+        {
+            var ms = elapsedMs.ToString("0.00", CultureInfo.InvariantCulture);
+            Console.WriteLine($"[{index}/{total}] {Path.GetFileName(imagePath)}  detections={detectionCount}  inference={ms} ms");
+        }
+
+        private static void PrintTimingSummary(List<double> timingsMs)
+        {
+            Console.WriteLine();
+            Console.WriteLine(new string('=', 80));
+            Console.WriteLine("Inference Timing Summary (excluding warmup / draw / save)");
+            Console.WriteLine(new string('=', 80));
+
+            if (timingsMs.Count == 0)
+            {
+                Console.WriteLine("No successful inferences.");
+                return;
+            }
+
+            var avg = timingsMs.Average();
+            var min = timingsMs.Min();
+            var max = timingsMs.Max();
+            var total = timingsMs.Sum();
+            var fps = avg > 0 ? 1000.0 / avg : 0;
+
+            Console.WriteLine($"Images      : {timingsMs.Count}");
+            Console.WriteLine($"Total      : {total.ToString("0.00", CultureInfo.InvariantCulture)} ms");
+            Console.WriteLine($"Avg        : {avg.ToString("0.00", CultureInfo.InvariantCulture)} ms  (~{fps.ToString("0.00", CultureInfo.InvariantCulture)} FPS)");
+            Console.WriteLine($"Min        : {min.ToString("0.00", CultureInfo.InvariantCulture)} ms");
+            Console.WriteLine($"Max        : {max.ToString("0.00", CultureInfo.InvariantCulture)} ms");
+        }
+
+          private static string[] LoadLabels(string path)
             => File.ReadAllLines(path)
                 .Where(label => string.IsNullOrWhiteSpace(label) is false)
                 .ToArray();
-
         private static bool EnsureDemoAssets(string modelPath, string classNamesPath, bool segmentation)
         {
             if (File.Exists(modelPath) && File.Exists(classNamesPath))
@@ -148,48 +275,13 @@ namespace RFDETRNanoDemo
             };
         }
 
-        private static void PrintResults(List<ObjectDetection> results)
-        {
-            Console.WriteLine();
-            Console.WriteLine($"Inference Results: {results.Count} objects");
-            Console.WriteLine(new string('=', 80));
-
-            Console.ForegroundColor = ConsoleColor.Blue;
-
-            foreach (var result in results)
-            {
-                var label = result.Label.Name;
-                var confidence = (result.Confidence * 100).ToString("0.##", CultureInfo.InvariantCulture);
-                Console.WriteLine($"{label} ({confidence}%)");
-            }
-
-            Console.ForegroundColor = ConsoleColor.Gray;
-        }
-
-        private static void PrintResults(List<Segmentation> results)
-        {
-            Console.WriteLine();
-            Console.WriteLine($"Inference Results: {results.Count} segmentations");
-            Console.WriteLine(new string('=', 80));
-
-            Console.ForegroundColor = ConsoleColor.Blue;
-
-            foreach (var result in results)
-            {
-                var label = result.Label.Name;
-                var confidence = (result.Confidence * 100).ToString("0.##", CultureInfo.InvariantCulture);
-                Console.WriteLine($"{label} ({confidence}%) maskBytes={result.BitPackedPixelMask.Length}");
-            }
-
-            Console.ForegroundColor = ConsoleColor.Gray;
-        }
-
         private static void CreateOutputFolder()
         {
             _outputFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "YoloDotNet_Results");
+            _trtEngineCacheFolder = Path.Combine(_outputFolder, "TensorRT_Engine_Cache");
 
-            if (Directory.Exists(_outputFolder) is false)
-                Directory.CreateDirectory(_outputFolder);
+            if (Directory.Exists(_trtEngineCacheFolder) is false)
+                Directory.CreateDirectory(_trtEngineCacheFolder);
         }
 
         private static void DisplayOutputFolder()

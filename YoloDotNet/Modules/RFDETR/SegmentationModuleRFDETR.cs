@@ -21,6 +21,9 @@ namespace YoloDotNet.Modules.RFDETR
         private readonly LabelModel[] _labels;
         private int[] _topIndices = [];
         private float[] _topScores = [];
+        private int[] _maskColumnX0 = [];
+        private int[] _maskColumnX1 = [];
+        private float[] _maskColumnXWeight = [];
         private List<Segmentation> _results = default!;
 
         public event EventHandler VideoProgressEvent = delegate { };
@@ -259,6 +262,24 @@ namespace YoloDotNet.Modules.RFDETR
             var xScale = (float)cropWidth / imageSize.Width;
             var yScale = (float)cropHeight / imageSize.Height;
 
+            // The X-axis source column (x0/x1/weight) only depends on x, not y, but the mask is
+            // sampled at the box's full original-image pixel resolution (targetWidth x targetHeight).
+            // Precomputing it once instead of per-row avoids redoing the same floor/clamp/subtract
+            // work up to targetHeight times per column, which otherwise dominates for large boxes
+            // on large source images.
+            var (columnX0, columnX1, columnXWeight) = GetMaskColumnBuffers(targetWidth);
+
+            for (var x = 0; x < targetWidth; x++)
+            {
+                var absoluteX = box.Left + x;
+                var sourceX = (absoluteX + 0.5f) * xScale - 0.5f;
+                var x0Local = Math.Clamp((int)MathF.Floor(sourceX), 0, cropWidth - 1);
+
+                columnX0[x] = cropLeft + x0Local;
+                columnX1[x] = cropLeft + (x0Local < cropWidth - 1 ? x0Local + 1 : x0Local);
+                columnXWeight[x] = sourceX - x0Local;
+            }
+
             for (var y = 0; y < targetHeight; y++)
             {
                 var absoluteY = box.Top + y;
@@ -272,13 +293,9 @@ namespace YoloDotNet.Modules.RFDETR
 
                 for (var x = 0; x < targetWidth; x++)
                 {
-                    var absoluteX = box.Left + x;
-                    var sourceX = (absoluteX + 0.5f) * xScale - 0.5f;
-                    var x0Local = Math.Clamp((int)MathF.Floor(sourceX), 0, cropWidth - 1);
-                    var x1Local = x0Local < cropWidth - 1 ? x0Local + 1 : x0Local;
-                    var xWeight = sourceX - x0Local;
-                    var x0 = cropLeft + x0Local;
-                    var x1 = cropLeft + x1Local;
+                    var x0 = columnX0[x];
+                    var x1 = columnX1[x];
+                    var xWeight = columnXWeight[x];
                     var topLeft = masksSpan[row0 + x0];
                     var topRight = masksSpan[row0 + x1];
                     var bottomLeft = masksSpan[row1 + x0];
@@ -307,6 +324,18 @@ namespace YoloDotNet.Modules.RFDETR
             }
 
             return (_topIndices, _topScores);
+        }
+
+        private (int[] ColumnX0, int[] ColumnX1, float[] ColumnXWeight) GetMaskColumnBuffers(int size)
+        {
+            if (_maskColumnX0.Length < size)
+            {
+                _maskColumnX0 = new int[size];
+                _maskColumnX1 = new int[size];
+                _maskColumnXWeight = new float[size];
+            }
+
+            return (_maskColumnX0, _maskColumnX1, _maskColumnXWeight);
         }
 
         private static void SortTopKDescending(int[] indices, float[] scores, int length)
