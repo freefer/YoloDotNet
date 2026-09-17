@@ -6,6 +6,12 @@ namespace YoloDotNet.Extensions
 {
     public static class ImageResizeExtension
     {
+        private static readonly SKSamplingOptions LinearNoMipmap = new(SKFilterMode.Linear, SKMipmapMode.None);
+
+        private static readonly Vector128<byte> ShuffleR = Vector128.Create((byte)0, 4, 8, 12, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80);
+        private static readonly Vector128<byte> ShuffleG = Vector128.Create((byte)1, 5, 9, 13, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80);
+        private static readonly Vector128<byte> ShuffleB = Vector128.Create((byte)2, 6, 10, 14, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80);
+
         /// <summary>
         /// Resizes the input image to the target dimensions by stretching it to fit the model input size, returning a pointer to RGB888x pixel data and the new dimensions.
         /// </summary>
@@ -13,131 +19,70 @@ namespace YoloDotNet.Extensions
         /// This method is intended for models trained on stretched (non-aspect-ratio-preserving) datasets.
         /// Using this with models trained on letterbox/proportional preprocessing may reduce inference accuracy.
         /// For standard models, use <see cref="ResizeImageProportional{T}"/> instead.
+        /// Destination size comes from <paramref name="pinnedMemoryBuffer"/> (ONNX input H×W), not a hardcoded value.
         /// </remarks>
-        /// <param name="img">The original image to resize.</param>
-        /// <param name="samplingOptions">Sampling options used during resizing.</param>
-        /// <param name="pinnedMemoryBuffer">A pinned memory buffer where the resized image will be written.</param>
-        /// <param name="roi">Optional region of interest to crop before resizing.</param>
-        /// <returns>The dimensions of the input image (or ROI if specified), required for bounding box scaling.</returns>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static SKSizeI ResizeImageStretched<T>(this T img, SKSamplingOptions samplingOptions, PinnedMemoryBuffer pinnedMemoryBuffer, SKRectI? roi = null)
         {
-            SKImage image = default!;
-            var createdImage = false;
-
-            if (img is SKImage skImage)
-            {
-                image = roi.HasValue
-                    ? YoloCore.CropToRoi(skImage, (SKRectI)roi)
-                    : skImage;
-            }
-            else if (img is SKBitmap skBitmap)
-            {
-                image = roi.HasValue
-                    ? YoloCore.CropToRoi(skBitmap, (SKRectI)roi)
-                    : SKImage.FromPixels(skBitmap.Info, skBitmap.GetPixels());
-
-                createdImage = true;
-            }
+            var (image, createdImage) = CreateSourceImage(img, roi);
 
             int modelWidth = pinnedMemoryBuffer.ImageInfo.Width;
             int modelHeight = pinnedMemoryBuffer.ImageInfo.Height;
             int width = image.Width;
             int height = image.Height;
 
-            // Stretch the image to fit the model input size regardless of aspect ratio and cropped ROI.
-            // This may distort the image but ensures it matches the model's expected input dimensions.
-            var srcRect = new SKRect(0, 0, image.Width, image.Height);
-            var destRect = new SKRect(0, 0, modelWidth, modelHeight);
+            DrawResized(image, pinnedMemoryBuffer.Canvas, samplingOptions, modelWidth, modelHeight, destX: 0, destY: 0);
 
-            pinnedMemoryBuffer.Canvas.DrawImage(image, srcRect, destRect, samplingOptions);
-
-            // Only dispose if we created a new SKImage from SKBitmap or if we cropped to a ROI, since cropping creates a new SKImage instance
             if (createdImage || roi.HasValue)
-                image?.Dispose();
+                image.Dispose();
 
-            // Return the input image dimensions (ROI dimensions if cropped), required to correctly scale bounding boxes
             return new SKSizeI(width, height);
         }
 
         /// <summary>
         /// Resizes the input image proportionally to fit the model input size, with RGB888x format and padded borders, returning a pointer to the pixel data and the new image dimensions.
         /// </summary>
-        /// <param name="img">The original image to resize.</param>
-        /// <param name="samplingOptions">Sampling options used during resizing.</param>
-        /// <param name="pinnedMemoryBuffer">A pinned memory buffer where the resized image will be written.</param>
-        /// <param name="roi">Optional region of interest to crop before resizing.</param>
-        /// <returns>The dimensions of the input image (or ROI if specified), required for bounding box scaling.</returns>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static SKSizeI ResizeImageProportional<T>(this T img, SKSamplingOptions samplingOptions, PinnedMemoryBuffer pinnedMemoryBuffer, SKRectI? roi = null)
         {
-            SKImage image = default!;
-            var createdImage = false;
-
-            if (img is SKImage skImage)
-            {
-                image = roi.HasValue
-                    ? YoloCore.CropToRoi(skImage, (SKRectI)roi)
-                    : skImage;
-            }
-            else if (img is SKBitmap skBitmap)
-            {
-                image = roi.HasValue
-                    ? YoloCore.CropToRoi(skBitmap, (SKRectI)roi)
-                    : SKImage.FromPixels(skBitmap.Info, skBitmap.GetPixels());
-
-                createdImage = true;
-            }
+            var (image, createdImage) = CreateSourceImage(img, roi);
 
             int modelWidth = pinnedMemoryBuffer.ImageInfo.Width;
             int modelHeight = pinnedMemoryBuffer.ImageInfo.Height;
             int width = image.Width;
             int height = image.Height;
 
-            // If the image is smaller than the model input size, we can draw it directly onto the pinned memory buffer canvas without resizing, which avoids unnecessary resampling and preserves image quality.
             if (width < modelWidth && height < modelHeight)
             {
                 int x = (modelWidth - width) / 2;
                 int y = (modelHeight - height) / 2;
-                var srcRect = new SKRect(0, 0, width, height);
-                var dstRect = new SKRect(x, y, x + width, y + height);
-                pinnedMemoryBuffer.Canvas.DrawImage(image, srcRect, dstRect, samplingOptions);
+                pinnedMemoryBuffer.Canvas.DrawImage(
+                    image,
+                    new SKRect(0, 0, width, height),
+                    new SKRect(x, y, x + width, y + height),
+                    samplingOptions);
             }
             else
             {
-                // Calculate the new image size based on the aspect ratio
                 float scaleFactor = Math.Min((float)modelWidth / width, (float)modelHeight / height);
-
-                // Use integer rounding instead of Math.Round
                 int newWidth = (int)((width * scaleFactor) + 0.5f);
                 int newHeight = (int)((height * scaleFactor) + 0.5f);
-
-                // Calculate the destination rectangle within the model dimensions
                 int x = (modelWidth - newWidth) / 2;
                 int y = (modelHeight - newHeight) / 2;
 
-                var srcRect = new SKRect(0, 0, width, height);
-                var dstRect = new SKRect(x, y, x + newWidth, y + newHeight);
-
-                // Draw the resized image onto the pinned memory buffer canvas as RGB888x with padding
-                pinnedMemoryBuffer.Canvas.DrawImage(image, srcRect, dstRect, samplingOptions);
+                DrawResized(image, pinnedMemoryBuffer.Canvas, samplingOptions, newWidth, newHeight, x, y);
             }
 
-            // Only dispose if we created a new SKImage from SKBitmap or if we cropped to a ROI, since cropping creates a new SKImage instance
             if (createdImage || roi.HasValue)
-                image?.Dispose();
+                image.Dispose();
 
-            // Return the input image dimensions (ROI dimensions if cropped), required to correctly scale bounding boxes
             return new SKSizeI(width, height);
         }
 
         /// <summary>
         /// Converts raw pixel image data to a normalized float array for model input.
+        /// Channel count and spatial size are taken from <paramref name="inputShape"/> (NCHW).
         /// </summary>
-        /// <param name="pixelsPtr">A pointer to the raw pixel image data in memory.</param>
-        /// <param name="inputShape">The shape of the input tensor.</param>
-        /// <param name="tensorBufferSize">The size of the tensor buffer, which should be equal to the product of the input shape dimensions.</param>
-        /// <param name="tensorArrayBuffer">A pre-allocated float array buffer to store the normalized pixel values.</param>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         unsafe public static void NormalizePixelsToArray(this IntPtr pixelsPtr,
             long[] inputShape,
@@ -150,50 +95,22 @@ namespace YoloDotNet.Extensions
             var height = (int)inputShape[2];
             var width = (int)inputShape[3];
             int totalPixels = width * height;
-
-            float inv255 = 1.0f / 255.0f;
             byte* src = (byte*)pixelsPtr;
-            var useMeanStd = mean?.Length >= 3 && std?.Length >= 3;
 
-            if (colorChannels == 1)
+            ResolveScaleBias(mean, std, out var scaleR, out var scaleG, out var scaleB, out var biasR, out var biasG, out var biasB);
+
+            fixed (float* dst = tensorArrayBuffer)
             {
-                float* dst = (float*)Unsafe.AsPointer(ref tensorArrayBuffer[0]);
-                int srcIndex = 0;
-
-                for (int i = 0; i < totalPixels; i++, srcIndex += 4)
-                {
-                    // Read only the grayscale component (assumed in R channel)
-                    var value = src[srcIndex] * inv255;
-                    dst[i] = useMeanStd ? (value - mean![0]) / std![0] : value;
-            }
-            }
-            else
-            {
-                float* dstR = (float*)Unsafe.AsPointer(ref tensorArrayBuffer[0]);
-                float* dstG = dstR + totalPixels;
-                float* dstB = dstG + totalPixels;
-
-                int srcIndex = 0;
-                for (int i = 0; i < totalPixels; i++, srcIndex += 4)
-        {
-                    var r = src[srcIndex] * inv255;
-                    var g = src[srcIndex + 1] * inv255;
-                    var b = src[srcIndex + 2] * inv255;
-
-                    dstR[i] = useMeanStd ? (r - mean![0]) / std![0] : r;
-                    dstG[i] = useMeanStd ? (g - mean![1]) / std![1] : g;
-                    dstB[i] = useMeanStd ? (b - mean![2]) / std![2] : b;
-            }
+                if (colorChannels == 1)
+                    NormalizeGray(src, dst, totalPixels, scaleR, biasR);
+                else
+                    NormalizeRgb(src, dst, totalPixels, scaleR, scaleG, scaleB, biasR, biasG, biasB);
             }
         }
 
         /// <summary>
         /// Overload of NormalizePixelsToArray that converts raw pixel image data to a normalized half-precision float (ushort) array for model input.
         /// </summary>
-        /// <param name="pixelsPtr"></param>
-        /// <param name="inputShape"></param>
-        /// <param name="tensorBufferSize"></param>
-        /// <param name="tensorArrayBuffer"></param>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         unsafe public static void NormalizePixelsToArray(this IntPtr pixelsPtr,
             long[] inputShape,
@@ -206,76 +123,342 @@ namespace YoloDotNet.Extensions
             var height = (int)inputShape[2];
             var width = (int)inputShape[3];
             int totalPixels = width * height;
-
-            float inv255 = 1.0f / 255.0f;
             byte* src = (byte*)pixelsPtr;
-            var useMeanStd = mean?.Length >= 3 && std?.Length >= 3;
 
-            if (colorChannels == 1)
+            ResolveScaleBias(mean, std, out var scaleR, out var scaleG, out var scaleB, out var biasR, out var biasG, out var biasB);
+
+            fixed (ushort* dst = tensorArrayBuffer)
             {
-                ushort* dst = (ushort*)Unsafe.AsPointer(ref tensorArrayBuffer[0]);
-                int srcIndex = 0;
-
-                for (int i = 0; i < totalPixels; i++, srcIndex += 4)
-                {
-                    var value = src[srcIndex] * inv255;
-                    dst[i] = FloatToUshort(useMeanStd ? (value - mean![0]) / std![0] : value);
-                }
-            }
-            else
-            {
-                ushort* dstR = (ushort*)Unsafe.AsPointer(ref tensorArrayBuffer[0]);
-                ushort* dstG = dstR + totalPixels;
-                ushort* dstB = dstG + totalPixels;
-
-                int srcIndex = 0;
-                for (int i = 0; i < totalPixels; i++, srcIndex += 4)
-                {
-                    var r = src[srcIndex] * inv255;
-                    var g = src[srcIndex + 1] * inv255;
-                    var b = src[srcIndex + 2] * inv255;
-
-                    dstR[i] = FloatToUshort(useMeanStd ? (r - mean![0]) / std![0] : r);
-                    dstG[i] = FloatToUshort(useMeanStd ? (g - mean![1]) / std![1] : g);
-                    dstB[i] = FloatToUshort(useMeanStd ? (b - mean![2]) / std![2] : b);
-                }
+                if (colorChannels == 1)
+                    NormalizeGrayHalf(src, dst, totalPixels, scaleR, biasR);
+                else
+                    NormalizeRgbHalf(src, dst, totalPixels, scaleR, scaleG, scaleB, biasR, biasG, biasB);
             }
         }
 
-        // Helper method to convert float to half-precision (16-bit) float (ushort)
-        unsafe private static ushort FloatToUshort(float value)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static (SKImage image, bool createdImage) CreateSourceImage<T>(T img, SKRectI? roi)
         {
-            // Avoid BitConverter for performance reasons and use unsafe cast instead.
-            uint f = *(uint*)&value;
-
-            // Extract parts
-            int sign = (int)(f >> 16) & 0x8000;
-            int exponent = (int)((f >> 23) & 0xFF) - 112;
-            int mantissa = (int)(f & 0x7FFFFF);
-
-            if (exponent <= 0)
+            if (img is SKImage skImage)
             {
-                if (exponent < -10)
-                {
-                    return (ushort)sign; // too small -> zero
-                }
-                mantissa = (mantissa | 0x800000) >> (1 - exponent);
-                return (ushort)(sign | (mantissa + 0xFFF + ((mantissa >> 13) & 1)) >> 13);
+                return roi.HasValue
+                    ? (YoloCore.CropToRoi(skImage, (SKRectI)roi), true)
+                    : (skImage, false);
             }
-            else if (exponent == 143 - 112) // Inf/NaN
+
+            if (img is SKBitmap skBitmap)
             {
-                if (mantissa == 0)
-                    return (ushort)(sign | 0x7C00); // Inf
-                return (ushort)(sign | 0x7C00 | (mantissa >> 13)); // NaN
-                }
-            else
+                var image = roi.HasValue
+                    ? YoloCore.CropToRoi(skBitmap, (SKRectI)roi)
+                    : SKImage.FromPixels(skBitmap.Info, skBitmap.GetPixels());
+                return (image, true);
+            }
+
+            throw new YoloDotNetException($"Unsupported image type: {typeof(T).Name}");
+        }
+
+        /// <summary>
+        /// Draws <paramref name="image"/> into a destination rectangle of the model's actual input size.
+        /// When mipmaps are requested and the source is more than 2× the destination, build an explicit
+        /// box-filter pyramid relative to that destination (not a fixed size) so quality matches
+        /// Linear+Mipmap without generating mipmaps for the full-resolution original.
+        /// </summary>
+        private static void DrawResized(
+            SKImage image,
+            SKCanvas canvas,
+            SKSamplingOptions samplingOptions,
+            int destWidth,
+            int destHeight,
+            int destX,
+            int destY)
+        {
+            var destRect = new SKRect(destX, destY, destX + destWidth, destY + destHeight);
+
+            if (!NeedsPyramid(samplingOptions, image.Width, image.Height, destWidth, destHeight))
             {
-                if (exponent > 30)
-                {
-                    return (ushort)(sign | 0x7C00); // overflow -> Inf
-                }
-                return (ushort)(sign | (exponent << 10) | (mantissa + 0xFFF + ((mantissa >> 13) & 1)) >> 13);
+                canvas.DrawImage(image, new SKRect(0, 0, image.Width, image.Height), destRect, samplingOptions);
+                return;
+            }
+
+            using var pyramid = BuildPyramid(image, destWidth, destHeight);
+            using var drawImage = SKImage.FromPixels(pyramid.Info, pyramid.GetPixels());
+            canvas.DrawImage(
+                drawImage,
+                new SKRect(0, 0, pyramid.Width, pyramid.Height),
+                destRect,
+                new SKSamplingOptions(samplingOptions.Filter, SKMipmapMode.None));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool NeedsPyramid(SKSamplingOptions samplingOptions, int srcW, int srcH, int destW, int destH)
+            => samplingOptions.Mipmap != SKMipmapMode.None
+               && destW > 0
+               && destH > 0
+               && (srcW > destW * 2 || srcH > destH * 2);
+
+        private static SKBitmap BuildPyramid(SKImage source, int destW, int destH)
+        {
+            using var pixmap = source.PeekPixels();
+            SKBitmap current = pixmap is not null
+                ? DownsampleStep(pixmap, destW, destH)
+                : DownsampleStep(SKBitmap.FromImage(source), destW, destH, disposeSource: true);
+
+            while (current.Width > destW * 2 || current.Height > destH * 2)
+            {
+                var next = DownsampleStep(current, destW, destH, disposeSource: false);
+                current.Dispose();
+                current = next;
+            }
+
+            return current;
+        }
+
+        private static SKBitmap DownsampleStep(SKBitmap source, int destW, int destH, bool disposeSource)
+        {
+            try
+            {
+                using var pixmap = source.PeekPixels();
+                if (pixmap is null)
+                    throw new YoloDotNetException("Failed to read source pixels for pyramid downsample.");
+
+                return DownsampleStep(pixmap, destW, destH);
+            }
+            finally
+            {
+                if (disposeSource)
+                    source.Dispose();
             }
         }
+
+        private static SKBitmap DownsampleStep(SKPixmap source, int destW, int destH)
+        {
+            int nextW = source.Width > destW * 2 ? Math.Max(destW, source.Width / 2) : source.Width;
+            int nextH = source.Height > destH * 2 ? Math.Max(destH, source.Height / 2) : source.Height;
+
+            if (nextW == source.Width && nextH == source.Height)
+            {
+                var copy = new SKBitmap(source.Info);
+                using var destPixmap = copy.PeekPixels();
+                if (destPixmap is not null)
+                    source.ReadPixels(destPixmap);
+                return copy;
+            }
+
+            var dst = new SKBitmap(source.Info.WithSize(nextW, nextH));
+            bool exactHalf = nextW * 2 == source.Width
+                             && nextH * 2 == source.Height
+                             && source.Info.BytesPerPixel is 1 or 4;
+
+            if (exactHalf)
+            {
+                BoxAverage2x2(
+                    source.GetPixels(),
+                    source.RowBytes,
+                    dst.GetPixels(),
+                    dst.RowBytes,
+                    nextW,
+                    nextH,
+                    source.Info.BytesPerPixel);
+            }
+            else
+            {
+                using var destPixmap = dst.PeekPixels();
+                if (destPixmap is null || !source.ScalePixels(destPixmap, LinearNoMipmap))
+                    throw new YoloDotNetException("Failed to downsample image to model input size.");
+            }
+
+            return dst;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe void BoxAverage2x2(
+            IntPtr srcPtr,
+            int srcStride,
+            IntPtr dstPtr,
+            int dstStride,
+            int dstW,
+            int dstH,
+            int bytesPerPixel)
+        {
+            byte* src = (byte*)srcPtr;
+            byte* dst = (byte*)dstPtr;
+
+            if (bytesPerPixel == 4)
+            {
+                for (int y = 0; y < dstH; y++)
+                {
+                    byte* row0 = src + (y * 2) * srcStride;
+                    byte* row1 = row0 + srcStride;
+                    byte* dest = dst + y * dstStride;
+
+                    for (int x = 0; x < dstW; x++)
+                    {
+                        int s = x * 8;
+                        int d = x * 4;
+                        dest[d] = (byte)((row0[s] + row0[s + 4] + row1[s] + row1[s + 4]) >> 2);
+                        dest[d + 1] = (byte)((row0[s + 1] + row0[s + 5] + row1[s + 1] + row1[s + 5]) >> 2);
+                        dest[d + 2] = (byte)((row0[s + 2] + row0[s + 6] + row1[s + 2] + row1[s + 6]) >> 2);
+                        dest[d + 3] = (byte)((row0[s + 3] + row0[s + 7] + row1[s + 3] + row1[s + 7]) >> 2);
+                    }
+                }
+
+                return;
+            }
+
+            for (int y = 0; y < dstH; y++)
+            {
+                byte* row0 = src + (y * 2) * srcStride;
+                byte* row1 = row0 + srcStride;
+                byte* dest = dst + y * dstStride;
+
+                for (int x = 0; x < dstW; x++)
+                    dest[x] = (byte)((row0[x * 2] + row0[x * 2 + 1] + row1[x * 2] + row1[x * 2 + 1]) >> 2);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void ResolveScaleBias(
+            float[]? mean,
+            float[]? std,
+            out float scaleR,
+            out float scaleG,
+            out float scaleB,
+            out float biasR,
+            out float biasG,
+            out float biasB)
+        {
+            const float inv255 = 1f / 255f;
+
+            if (mean is { Length: >= 3 } && std is { Length: >= 3 })
+            {
+                scaleR = inv255 / std[0];
+                scaleG = inv255 / std[1];
+                scaleB = inv255 / std[2];
+                biasR = -mean[0] / std[0];
+                biasG = -mean[1] / std[1];
+                biasB = -mean[2] / std[2];
+                return;
+            }
+
+            scaleR = scaleG = scaleB = inv255;
+            biasR = biasG = biasB = 0f;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe void NormalizeRgb(
+            byte* src,
+            float* dst,
+            int totalPixels,
+            float scaleR,
+            float scaleG,
+            float scaleB,
+            float biasR,
+            float biasG,
+            float biasB)
+        {
+            float* dstR = dst;
+            float* dstG = dst + totalPixels;
+            float* dstB = dstG + totalPixels;
+            int i = 0;
+
+            if (Avx.IsSupported && Ssse3.IsSupported && Sse41.IsSupported)
+            {
+                var vScaleR = Vector256.Create(scaleR);
+                var vScaleG = Vector256.Create(scaleG);
+                var vScaleB = Vector256.Create(scaleB);
+                var vBiasR = Vector256.Create(biasR);
+                var vBiasG = Vector256.Create(biasG);
+                var vBiasB = Vector256.Create(biasB);
+
+                for (; i <= totalPixels - 8; i += 8, src += 32)
+                {
+                    var px0 = Sse2.LoadVector128(src);
+                    var px1 = Sse2.LoadVector128(src + 16);
+
+                    var r = Vector256.Create(BytesToFloats(px0, ShuffleR), BytesToFloats(px1, ShuffleR));
+                    var g = Vector256.Create(BytesToFloats(px0, ShuffleG), BytesToFloats(px1, ShuffleG));
+                    var b = Vector256.Create(BytesToFloats(px0, ShuffleB), BytesToFloats(px1, ShuffleB));
+
+                    Avx.Store(dstR + i, MultiplyAdd(r, vScaleR, vBiasR));
+                    Avx.Store(dstG + i, MultiplyAdd(g, vScaleG, vBiasG));
+                    Avx.Store(dstB + i, MultiplyAdd(b, vScaleB, vBiasB));
+                }
+            }
+
+            for (; i < totalPixels; i++, src += 4)
+            {
+                dstR[i] = src[0] * scaleR + biasR;
+                dstG[i] = src[1] * scaleG + biasG;
+                dstB[i] = src[2] * scaleB + biasB;
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe void NormalizeGray(byte* src, float* dst, int totalPixels, float scale, float bias)
+        {
+            int i = 0;
+
+            if (Avx.IsSupported && Ssse3.IsSupported && Sse41.IsSupported)
+            {
+                var vScale = Vector256.Create(scale);
+                var vBias = Vector256.Create(bias);
+
+                for (; i <= totalPixels - 8; i += 8, src += 32)
+                {
+                    var px0 = Sse2.LoadVector128(src);
+                    var px1 = Sse2.LoadVector128(src + 16);
+                    var gray = Vector256.Create(BytesToFloats(px0, ShuffleR), BytesToFloats(px1, ShuffleR));
+                    Avx.Store(dst + i, MultiplyAdd(gray, vScale, vBias));
+                }
+            }
+
+            for (; i < totalPixels; i++, src += 4)
+                dst[i] = src[0] * scale + bias;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe void NormalizeRgbHalf(
+            byte* src,
+            ushort* dst,
+            int totalPixels,
+            float scaleR,
+            float scaleG,
+            float scaleB,
+            float biasR,
+            float biasG,
+            float biasB)
+        {
+            ushort* dstR = dst;
+            ushort* dstG = dst + totalPixels;
+            ushort* dstB = dstG + totalPixels;
+
+            for (int i = 0; i < totalPixels; i++, src += 4)
+            {
+                dstR[i] = FloatToUshort(src[0] * scaleR + biasR);
+                dstG[i] = FloatToUshort(src[1] * scaleG + biasG);
+                dstB[i] = FloatToUshort(src[2] * scaleB + biasB);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe void NormalizeGrayHalf(byte* src, ushort* dst, int totalPixels, float scale, float bias)
+        {
+            for (int i = 0; i < totalPixels; i++, src += 4)
+                dst[i] = FloatToUshort(src[0] * scale + bias);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector128<float> BytesToFloats(Vector128<byte> pixels, Vector128<byte> shuffle)
+            => Sse2.ConvertToVector128Single(Sse41.ConvertToVector128Int32(Ssse3.Shuffle(pixels, shuffle)));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector256<float> MultiplyAdd(Vector256<float> value, Vector256<float> scale, Vector256<float> bias)
+            => Fma.IsSupported
+                ? Fma.MultiplyAdd(value, scale, bias)
+                : Avx.Add(Avx.Multiply(value, scale), bias);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static ushort FloatToUshort(float value)
+            => BitConverter.HalfToUInt16Bits((Half)value);
     }
 }

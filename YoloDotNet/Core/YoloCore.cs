@@ -17,6 +17,8 @@ namespace YoloDotNet.Core
         private int _modelInputWidth;
         private int _modelInputHeight;
         private int _inputShapeSize;
+        private float[] _floatInputBuffer = [];
+        private ushort[] _halfInputBuffer = [];
         #endregion
 
         #region Properties
@@ -45,6 +47,11 @@ namespace YoloDotNet.Core
 
             _pinnedMemoryPool = new PinnedMemoryBufferPool(_imageInfo);
 
+            if (OnnxModel.ModelDataType == ModelDataType.Float16)
+                _halfInputBuffer = GC.AllocateUninitializedArray<ushort>(_inputShapeSize, pinned: true);
+            else
+                _floatInputBuffer = GC.AllocateUninitializedArray<float>(_inputShapeSize, pinned: true);
+
             FrameSaveService.Start();
         }
 
@@ -67,35 +74,19 @@ namespace YoloDotNet.Core
                             ? image.ResizeImageProportional(YoloOptions.SamplingOptions, pinnedBuffer, roi)
                             : image.ResizeImageStretched(YoloOptions.SamplingOptions, pinnedBuffer, roi);
 
+                    
                     InferenceResult inferenceResult;
 
                     if (OnnxModel.ModelDataType == ModelDataType.Float16)
                     {
-                        var pixelBuffer = ArrayPool<ushort>.Shared.Rent(_inputShapeSize);
-
-                        try
-                        {
-                            pinnedBuffer.Pointer.NormalizePixelsToArray(_inputShape, _inputShapeSize, pixelBuffer, YoloOptions.ImageMean, YoloOptions.ImageStd);
-                            inferenceResult = YoloOptions.ExecutionProvider.Run<ushort>(pixelBuffer);
-                        }
-                        finally
-                        {
-                            ArrayPool<ushort>.Shared.Return(pixelBuffer, clearArray: false);
-                        }
+                        pinnedBuffer.Pointer.NormalizePixelsToArray(_inputShape, _inputShapeSize, _halfInputBuffer, YoloOptions.ImageMean, YoloOptions.ImageStd);
+                        inferenceResult = YoloOptions.ExecutionProvider.Run<ushort>(_halfInputBuffer);
                     }
                     else
                     {
-                        var pixelBuffer = ArrayPool<float>.Shared.Rent(_inputShapeSize);
-
-                        try
-                        {
-                            pinnedBuffer.Pointer.NormalizePixelsToArray(_inputShape, _inputShapeSize, pixelBuffer, YoloOptions.ImageMean, YoloOptions.ImageStd);
-                            inferenceResult = YoloOptions.ExecutionProvider.Run<float>(pixelBuffer);
-                        }
-                        finally
-                        {
-                            ArrayPool<float>.Shared.Return(pixelBuffer, clearArray: false);
-                        }
+                        pinnedBuffer.Pointer.NormalizePixelsToArray(_inputShape, _inputShapeSize, _floatInputBuffer, YoloOptions.ImageMean, YoloOptions.ImageStd);
+ 
+                        inferenceResult = YoloOptions.ExecutionProvider.Run<float>(_floatInputBuffer);
                     }
 
                     // Attach original image size for downstream box scaling
@@ -105,7 +96,7 @@ namespace YoloDotNet.Core
                 }
                 finally
                 {
-                    _pinnedMemoryPool.Return(pinnedBuffer);
+                    _pinnedMemoryPool.Return(pinnedBuffer, clear: YoloOptions.ImageResize == ImageResize.Proportional);
                 }
             }
         }
