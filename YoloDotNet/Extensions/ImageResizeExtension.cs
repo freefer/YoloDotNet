@@ -11,6 +11,8 @@ namespace YoloDotNet.Extensions
         private static readonly Vector128<byte> ShuffleR = Vector128.Create((byte)0, 4, 8, 12, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80);
         private static readonly Vector128<byte> ShuffleG = Vector128.Create((byte)1, 5, 9, 13, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80);
         private static readonly Vector128<byte> ShuffleB = Vector128.Create((byte)2, 6, 10, 14, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80);
+        private static readonly Vector128<byte> ShuffleRFromBgra = Vector128.Create((byte)2, 6, 10, 14, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80);
+        private static readonly Vector128<byte> ShuffleBFromBgra = Vector128.Create((byte)0, 4, 8, 12, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80);
 
         /// <summary>
         /// Resizes the input image to the target dimensions by stretching it to fit the model input size, returning a pointer to RGB888x pixel data and the new dimensions.
@@ -77,6 +79,346 @@ namespace YoloDotNet.Extensions
                 image.Dispose();
 
             return new SKSizeI(width, height);
+        }
+
+        /// <summary>
+        /// Copies the image into the model input buffer without scaling.
+        /// The source must already match the model input size.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static SKSizeI CopyImage<T>(this T img, PinnedMemoryBuffer pinnedMemoryBuffer, SKRectI? roi = null)
+        {
+            var (image, createdImage) = CreateSourceImage(img, roi);
+
+            int modelWidth = pinnedMemoryBuffer.ImageInfo.Width;
+            int modelHeight = pinnedMemoryBuffer.ImageInfo.Height;
+            int width = image.Width;
+            int height = image.Height;
+
+            try
+            {
+                if (width != modelWidth || height != modelHeight)
+                    throw new YoloDotNetException($"Image size {width}x{height} does not match model input {modelWidth}x{modelHeight}.");
+
+                pinnedMemoryBuffer.Canvas.DrawImage(image, 0, 0);
+                return new SKSizeI(width, height);
+            }
+            finally
+            {
+                if (createdImage || roi.HasValue)
+                    image.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// 源图（或 ROI）已经是模型输入尺寸时，直接把像素归一化写入 NCHW，跳过 Canvas 中转。
+        /// 只接受不透明的 Rgba8888 / Rgb888x / Bgra8888 / Gray8。其余格式返回 false，由调用方走绘制路径。
+        /// </summary>
+        public static bool TryNormalizeMatched<T>(
+            this T image,
+            int modelWidth,
+            int modelHeight,
+            int channels,
+            float[] destination,
+            out SKSizeI sourceSize,
+            SKRectI? roi = null,
+            float[]? mean = null,
+            float[]? std = null)
+            => TryNormalizeMatched(image, modelWidth, modelHeight, channels, roi, mean, std, destination, null, out sourceSize);
+
+        /// <summary>
+        /// <see cref="TryNormalizeMatched{T}(T, int, int, int, float[], out SKSizeI, SKRectI?, float[], float[])"/> 的半精度版本。
+        /// </summary>
+        public static bool TryNormalizeMatched<T>(
+            this T image,
+            int modelWidth,
+            int modelHeight,
+            int channels,
+            ushort[] destination,
+            out SKSizeI sourceSize,
+            SKRectI? roi = null,
+            float[]? mean = null,
+            float[]? std = null)
+            => TryNormalizeMatched(image, modelWidth, modelHeight, channels, roi, mean, std, null, destination, out sourceSize);
+
+        private static bool TryNormalizeMatched<T>(
+            T image,
+            int modelWidth,
+            int modelHeight,
+            int channels,
+            SKRectI? roi,
+            float[]? mean,
+            float[]? std,
+            float[]? floatDestination,
+            ushort[]? halfDestination,
+            out SKSizeI sourceSize)
+        {
+            sourceSize = default;
+            if (modelWidth <= 0 || modelHeight <= 0 || channels is not (1 or 3))
+                return false;
+
+            var needed = modelWidth * modelHeight * channels;
+            if (floatDestination is not null && floatDestination.Length < needed)
+                return false;
+            if (halfDestination is not null && halfDestination.Length < needed)
+                return false;
+            if (floatDestination is null && halfDestination is null)
+                return false;
+
+            var pixels = GetRasterPixels(image, out var info, out var rowBytes, out var pixmap);
+            try
+            {
+                if (pixels == IntPtr.Zero || rowBytes <= 0)
+                    return false;
+
+                var colorSpace = info.ColorSpace;
+                if (colorSpace is not null && !colorSpace.IsSrgb)
+                    return false;
+
+                if (info.AlphaType is not (SKAlphaType.Opaque or SKAlphaType.Unpremul))
+                    return false;
+
+                var originX = 0;
+                var originY = 0;
+                var width = info.Width;
+                var height = info.Height;
+                if (roi.HasValue)
+                {
+                    var region = roi.Value;
+                    originX = region.Left;
+                    originY = region.Top;
+                    width = region.Width;
+                    height = region.Height;
+                }
+
+                if (width != modelWidth || height != modelHeight)
+                    return false;
+                if (originX < 0 || originY < 0 || width <= 0 || height <= 0)
+                    return false;
+                if (originX > info.Width - width || originY > info.Height - height)
+                    return false;
+
+                var bytesPerPixel = info.BytesPerPixel;
+                if ((long)originX * bytesPerPixel + (long)width * bytesPerPixel > rowBytes)
+                    return false;
+
+                ResolveScaleBias(mean, std, out var scaleR, out var scaleG, out var scaleB, out var biasR, out var biasG, out var biasB);
+                unsafe
+                {
+                    var src = (byte*)pixels + (long)originY * rowBytes + (long)originX * bytesPerPixel;
+                    if (channels == 1)
+                    {
+                        if (info.ColorType != SKColorType.Gray8 || bytesPerPixel != 1)
+                            return false;
+
+                        if (halfDestination is not null)
+                        {
+                            fixed (ushort* dst = halfDestination)
+                                NormalizeGrayHalfRows(src, rowBytes, width, height, dst, scaleR, biasR);
+                        }
+                        else
+                        {
+                            fixed (float* dst = floatDestination)
+                                NormalizeGrayRows(src, rowBytes, width, height, dst, scaleR, biasR);
+                        }
+                    }
+                    else
+                    {
+                        int red;
+                        int blue;
+                        Vector128<byte> shuffleR;
+                        Vector128<byte> shuffleB;
+                        switch (info.ColorType)
+                        {
+                            case SKColorType.Rgba8888:
+                            case SKColorType.Rgb888x:
+                                red = 0;
+                                blue = 2;
+                                shuffleR = ShuffleR;
+                                shuffleB = ShuffleB;
+                                break;
+                            case SKColorType.Bgra8888:
+                                red = 2;
+                                blue = 0;
+                                shuffleR = ShuffleRFromBgra;
+                                shuffleB = ShuffleBFromBgra;
+                                break;
+                            default:
+                                return false;
+                        }
+
+                        if (bytesPerPixel != 4)
+                            return false;
+
+                        if (halfDestination is not null)
+                        {
+                            fixed (ushort* dst = halfDestination)
+                                NormalizeRgbHalfRows(src, rowBytes, width, height, dst, red, 1, blue, scaleR, scaleG, scaleB, biasR, biasG, biasB);
+                        }
+                        else
+                        {
+                            fixed (float* dst = floatDestination)
+                                NormalizeRgbRows(src, rowBytes, width, height, dst, shuffleR, ShuffleG, shuffleB, red, 1, blue, scaleR, scaleG, scaleB, biasR, biasG, biasB);
+                        }
+                    }
+                }
+
+                sourceSize = new SKSizeI(width, height);
+                return true;
+            }
+            finally
+            {
+                pixmap?.Dispose();
+            }
+        }
+
+        private static IntPtr GetRasterPixels<T>(T image, out SKImageInfo info, out int rowBytes, out SKPixmap? pixmap)
+        {
+            switch (image)
+            {
+                case SKBitmap bitmap:
+                    pixmap = null;
+                    info = bitmap.Info;
+                    rowBytes = bitmap.RowBytes;
+                    return bitmap.GetPixels();
+                case SKImage skImage:
+                    pixmap = skImage.PeekPixels();
+                    if (pixmap is null)
+                    {
+                        info = default;
+                        rowBytes = 0;
+                        return IntPtr.Zero;
+                    }
+
+                    info = pixmap.Info;
+                    rowBytes = pixmap.RowBytes;
+                    return pixmap.GetPixels();
+                default:
+                    pixmap = null;
+                    info = default;
+                    rowBytes = 0;
+                    return IntPtr.Zero;
+            }
+        }
+
+        private static unsafe void NormalizeRgbRows(
+            byte* src,
+            int stride,
+            int width,
+            int height,
+            float* dst,
+            Vector128<byte> shuffleR,
+            Vector128<byte> shuffleG,
+            Vector128<byte> shuffleB,
+            int redOffset,
+            int greenOffset,
+            int blueOffset,
+            float scaleR,
+            float scaleG,
+            float scaleB,
+            float biasR,
+            float biasG,
+            float biasB)
+        {
+            var plane = width * height;
+            float* dstR = dst;
+            float* dstG = dst + plane;
+            float* dstB = dstG + plane;
+            var vector = Avx.IsSupported && Ssse3.IsSupported && Sse41.IsSupported;
+            var vScaleR = vector ? Vector256.Create(scaleR) : default;
+            var vScaleG = vector ? Vector256.Create(scaleG) : default;
+            var vScaleB = vector ? Vector256.Create(scaleB) : default;
+            var vBiasR = vector ? Vector256.Create(biasR) : default;
+            var vBiasG = vector ? Vector256.Create(biasG) : default;
+            var vBiasB = vector ? Vector256.Create(biasB) : default;
+            var pixel = 0;
+
+            for (var y = 0; y < height; y++)
+            {
+                var row = src + y * stride;
+                var x = 0;
+
+                if (vector)
+                {
+                    for (; x <= width - 8; x += 8, pixel += 8)
+                    {
+                        var p = row + (x << 2);
+                        var px0 = Sse2.LoadVector128(p);
+                        var px1 = Sse2.LoadVector128(p + 16);
+                        var r = Vector256.Create(BytesToFloats(px0, shuffleR), BytesToFloats(px1, shuffleR));
+                        var g = Vector256.Create(BytesToFloats(px0, shuffleG), BytesToFloats(px1, shuffleG));
+                        var b = Vector256.Create(BytesToFloats(px0, shuffleB), BytesToFloats(px1, shuffleB));
+                        Avx.Store(dstR + pixel, MultiplyAdd(r, vScaleR, vBiasR));
+                        Avx.Store(dstG + pixel, MultiplyAdd(g, vScaleG, vBiasG));
+                        Avx.Store(dstB + pixel, MultiplyAdd(b, vScaleB, vBiasB));
+                    }
+                }
+
+                for (; x < width; x++, pixel++)
+                {
+                    var p = row + (x << 2);
+                    dstR[pixel] = p[redOffset] * scaleR + biasR;
+                    dstG[pixel] = p[greenOffset] * scaleG + biasG;
+                    dstB[pixel] = p[blueOffset] * scaleB + biasB;
+                }
+            }
+        }
+
+        private static unsafe void NormalizeGrayRows(byte* src, int stride, int width, int height, float* dst, float scale, float bias)
+        {
+            var pixel = 0;
+            for (var y = 0; y < height; y++)
+            {
+                var row = src + y * stride;
+                for (var x = 0; x < width; x++, pixel++)
+                    dst[pixel] = row[x] * scale + bias;
+            }
+        }
+
+        private static unsafe void NormalizeRgbHalfRows(
+            byte* src,
+            int stride,
+            int width,
+            int height,
+            ushort* dst,
+            int redOffset,
+            int greenOffset,
+            int blueOffset,
+            float scaleR,
+            float scaleG,
+            float scaleB,
+            float biasR,
+            float biasG,
+            float biasB)
+        {
+            var plane = width * height;
+            ushort* dstR = dst;
+            ushort* dstG = dst + plane;
+            ushort* dstB = dstG + plane;
+            var pixel = 0;
+
+            for (var y = 0; y < height; y++)
+            {
+                var row = src + y * stride;
+                for (var x = 0; x < width; x++, pixel++)
+                {
+                    var p = row + (x << 2);
+                    dstR[pixel] = FloatToUshort(p[redOffset] * scaleR + biasR);
+                    dstG[pixel] = FloatToUshort(p[greenOffset] * scaleG + biasG);
+                    dstB[pixel] = FloatToUshort(p[blueOffset] * scaleB + biasB);
+                }
+            }
+        }
+
+        private static unsafe void NormalizeGrayHalfRows(byte* src, int stride, int width, int height, ushort* dst, float scale, float bias)
+        {
+            var pixel = 0;
+            for (var y = 0; y < height; y++)
+            {
+                var row = src + y * stride;
+                for (var x = 0; x < width; x++, pixel++)
+                    dst[pixel] = FloatToUshort(row[x] * scale + bias);
+            }
         }
 
         /// <summary>

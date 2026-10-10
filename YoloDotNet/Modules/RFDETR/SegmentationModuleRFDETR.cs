@@ -89,15 +89,16 @@ namespace YoloDotNet.Modules.RFDETR
 
             var (xPad, yPad, xGain, yGain) = _yoloCore.CalculateGain(imageSize);
             var (topIndices, topScores) = GetTopKBuffers(_predictions);
-            var topCount = GetRankedCandidates(logitsSpan, topIndices, topScores);
+            var scoreCount = Math.Min(logitsSpan.Length, _predictions * _totalLabels);
+            var topCount = YoloCore.SelectTopIndices(logitsSpan[..scoreCount], _predictions, topIndices, topScores);
             var validBoxCount = 0;
 
             for (var candidateIndex = 0; candidateIndex < topCount; candidateIndex++)
             {
-                var candidateConfidence = topScores[candidateIndex];
+                var candidateConfidence = YoloCore.Sigmoid(topScores[candidateIndex]);
 
                 if (candidateConfidence < confidenceThreshold)
-                    continue;
+                    break;
 
                 var flatIndex = topIndices[candidateIndex];
                 var prediction = flatIndex / _totalLabels;
@@ -170,62 +171,6 @@ namespace YoloDotNet.Modules.RFDETR
             }
 
             return validBoxCount;
-        }
-
-        private int GetRankedCandidates(ReadOnlySpan<float> logitsSpan, int[] topIndices, float[] topScores)
-        {
-            var topCount = 0;
-            var minScore = float.PositiveInfinity;
-            var minPosition = -1;
-
-            for (var prediction = 0; prediction < _predictions; prediction++)
-            {
-                var labelOffset = prediction * _totalLabels;
-
-                for (var labelIndex = 0; labelIndex < _totalLabels; labelIndex++)
-                {
-                    var confidence = YoloCore.Sigmoid(logitsSpan[labelOffset + labelIndex]);
-                    var flatIndex = labelOffset + labelIndex;
-
-                    if (topCount < _predictions)
-                    {
-                        topIndices[topCount] = flatIndex;
-                        topScores[topCount] = confidence;
-
-                        if (confidence < minScore)
-                        {
-                            minScore = confidence;
-                            minPosition = topCount;
-                        }
-
-                        topCount++;
-                        continue;
-                    }
-
-                    if (confidence <= minScore)
-                        continue;
-
-                    topIndices[minPosition] = flatIndex;
-                    topScores[minPosition] = confidence;
-                    minScore = topScores[0];
-                    minPosition = 0;
-
-                    for (var i = 1; i < topCount; i++)
-                    {
-                        var candidateScore = topScores[i];
-
-                        if (candidateScore < minScore)
-                        {
-                            minScore = candidateScore;
-                            minPosition = i;
-                        }
-                    }
-                }
-            }
-
-            SortTopKDescending(topIndices, topScores, topCount);
-
-            return topCount;
         }
 
         private byte[] PackMask(ReadOnlySpan<float> masksSpan, int maskOffset, SKRectI box, SKSizeI imageSize)
@@ -336,26 +281,6 @@ namespace YoloDotNet.Modules.RFDETR
             }
 
             return (_maskColumnX0, _maskColumnX1, _maskColumnXWeight);
-        }
-
-        private static void SortTopKDescending(int[] indices, float[] scores, int length)
-        {
-            for (var i = 1; i < length; i++)
-            {
-                var score = scores[i];
-                var index = indices[i];
-                var j = i - 1;
-
-                while (j >= 0 && scores[j] < score)
-                {
-                    scores[j + 1] = scores[j];
-                    indices[j + 1] = indices[j];
-                    j--;
-                }
-
-                scores[j + 1] = score;
-                indices[j + 1] = index;
-            }
         }
 
         private int MapLabelIndex(int labelIndex)

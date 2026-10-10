@@ -53,157 +53,108 @@ namespace YoloDotNet.Modules.RFDETR
         public List<ObjectDetection> ProcessImage<T>(T image, double confidence, double pixelConfidence, double iou, SKRectI? roi = null)
         {
             var inferenceResult = _yoloCore.Run(image, roi);
-            var detections = ObjectDetection(inferenceResult, confidence);
-
-            return YoloCore.InferenceResultsToType(detections, roi, _results, r => (ObjectDetection)r);
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private Span<ObjectResult> ObjectDetection(InferenceResult inferenceResult, double confidenceThreshold)
-        {
-            var imageSize = inferenceResult.ImageOriginalSize;
-            var boxesSpan = inferenceResult.OrtSpan0;
-            var logitsSpan = inferenceResult.OrtSpan1;
-
-            if (boxesSpan.IsEmpty || logitsSpan.IsEmpty)
-                return [];
-
-            var (xPad, yPad, xGain, yGain) = _yoloCore.CalculateGain(imageSize);
-            var resultBuffer = ArrayPool<ObjectResult>.Shared.Rent(_predictions * _totalLabels);
-            var validBoxCount = 0;
-            var (topIndices, topScores) = GetTopKBuffers(_predictions);
-            var topCount = 0;
-            var minScore = float.PositiveInfinity;
-            var minPosition = -1;
+            var resultBuffer = ArrayPool<ObjectResult>.Shared.Rent(Math.Max(_predictions, 1));
 
             try
             {
-                for (var prediction = 0; prediction < _predictions; prediction++)
-                {
-                    var labelOffset = prediction * _totalLabels;
-
-                    for (var labelIndex = 0; labelIndex < _totalLabels; labelIndex++)
-                    {
-                        var confidence = YoloCore.Sigmoid(logitsSpan[labelOffset + labelIndex]);
-                        var flatIndex = labelOffset + labelIndex;
-
-                        if (topCount < _predictions)
-                        {
-                            topIndices[topCount] = flatIndex;
-                            topScores[topCount] = confidence;
-
-                            if (confidence < minScore)
-                            {
-                                minScore = confidence;
-                                minPosition = topCount;
-                            }
-
-                            topCount++;
-                            continue;
-                        }
-
-                        if (confidence <= minScore)
-                            continue;
-
-                        topIndices[minPosition] = flatIndex;
-                        topScores[minPosition] = confidence;
-                        minScore = topScores[0];
-                        minPosition = 0;
-
-                        for (var i = 1; i < topCount; i++)
-                        {
-                            var candidateScore = topScores[i];
-
-                            if (candidateScore < minScore)
-                            {
-                                minScore = candidateScore;
-                                minPosition = i;
-                            }
-                        }
-                    }
-                }
-
-                SortTopKDescending(topIndices, topScores, topCount);
-
-                for (var candidateIndex = 0; candidateIndex < topCount; candidateIndex++)
-                {
-                    var candidateConfidence = topScores[candidateIndex];
-
-                    if (candidateConfidence < confidenceThreshold)
-                        continue;
-
-                    var flatIndex = topIndices[candidateIndex];
-                    var prediction = flatIndex / _totalLabels;
-                    var labelIndex = flatIndex - prediction * _totalLabels;
-
-                    if (_hasBackgroundClass && labelIndex == _backgroundClassIndex)
-                        continue;
-
-                    var mappedLabelIndex = MapLabelIndex(labelIndex);
-
-                    if (mappedLabelIndex < 0 || mappedLabelIndex >= _labels.Length)
-                        continue;
-
-                    var boxOffset = prediction * 4;
-                    var cx = boxesSpan[boxOffset];
-                    var cy = boxesSpan[boxOffset + 1];
-                    var w = boxesSpan[boxOffset + 2];
-                    var h = boxesSpan[boxOffset + 3];
-
-                    var xMin = cx - w * 0.5f;
-                    var yMin = cy - h * 0.5f;
-                    var xMax = cx + w * 0.5f;
-                    var yMax = cy + h * 0.5f;
-
-                    SKRectI boundingBox;
-                    SKRect boundingBoxUnscaled;
-
-                    if (_yoloCore.YoloOptions.ImageResize == ImageResize.Proportional)
-                    {
-                        var scaledXMin = xMin * _modelInputWidth - xPad;
-                        var scaledYMin = yMin * _modelInputHeight - yPad;
-                        var scaledXMax = xMax * _modelInputWidth - xPad;
-                        var scaledYMax = yMax * _modelInputHeight - yPad;
-
-                        boundingBox = ClampBox(
-                            scaledXMin * xGain,
-                            scaledYMin * xGain,
-                            scaledXMax * xGain,
-                            scaledYMax * xGain,
-                            imageSize);
-                        boundingBoxUnscaled = new SKRect(scaledXMin, scaledYMin, scaledXMax, scaledYMax);
-                    }
-                    else
-                    {
-                        boundingBox = ClampBox(
-                            xMin * imageSize.Width,
-                            yMin * imageSize.Height,
-                            xMax * imageSize.Width,
-                            yMax * imageSize.Height,
-                            imageSize);
-                        boundingBoxUnscaled = new SKRect(
-                            xMin * _modelInputWidth,
-                            yMin * _modelInputHeight,
-                            xMax * _modelInputWidth,
-                            yMax * _modelInputHeight);
-                    }
-
-                    resultBuffer[validBoxCount++] = new ObjectResult
-                    {
-                        Label = _labels[mappedLabelIndex],
-                        Confidence = candidateConfidence,
-                        BoundingBox = boundingBox,
-                        BoundingBoxUnscaled = boundingBoxUnscaled,
-                        BoundingBoxIndex = prediction
-                    };
-                }
-
-                return resultBuffer.AsSpan(0, validBoxCount);
+                var count = DecodeDetections(inferenceResult, confidence, resultBuffer);
+                return YoloCore.InferenceResultsToType(resultBuffer.AsSpan(0, count), roi, _results, r => (ObjectDetection)r);
             }
             finally
             {
                 ArrayPool<ObjectResult>.Shared.Return(resultBuffer, false);
             }
+        }
+
+        private int DecodeDetections(InferenceResult inferenceResult, double confidenceThreshold, ObjectResult[] resultBuffer)
+        {
+            var imageSize = inferenceResult.ImageOriginalSize;
+            var boxesSpan = inferenceResult.OrtSpan0;
+            var logitsSpan = inferenceResult.OrtSpan1;
+
+            if (boxesSpan.IsEmpty || logitsSpan.IsEmpty || resultBuffer.Length == 0)
+                return 0;
+
+            var (xPad, yPad, xGain, yGain) = _yoloCore.CalculateGain(imageSize);
+            var validBoxCount = 0;
+            var (topIndices, topScores) = GetTopKBuffers(_predictions);
+            var scoreCount = Math.Min(logitsSpan.Length, _predictions * _totalLabels);
+            var topCount = YoloCore.SelectTopIndices(logitsSpan[..scoreCount], _predictions, topIndices, topScores);
+
+            for (var candidateIndex = 0; candidateIndex < topCount; candidateIndex++)
+            {
+                var candidateConfidence = YoloCore.Sigmoid(topScores[candidateIndex]);
+
+                if (candidateConfidence < confidenceThreshold)
+                    break;
+
+                var flatIndex = topIndices[candidateIndex];
+                var prediction = flatIndex / _totalLabels;
+                var labelIndex = flatIndex - prediction * _totalLabels;
+
+                if (_hasBackgroundClass && labelIndex == _backgroundClassIndex)
+                    continue;
+
+                var mappedLabelIndex = MapLabelIndex(labelIndex);
+
+                if (mappedLabelIndex < 0 || mappedLabelIndex >= _labels.Length)
+                    continue;
+
+                var boxOffset = prediction * 4;
+                var cx = boxesSpan[boxOffset];
+                var cy = boxesSpan[boxOffset + 1];
+                var w = boxesSpan[boxOffset + 2];
+                var h = boxesSpan[boxOffset + 3];
+
+                var xMin = cx - w * 0.5f;
+                var yMin = cy - h * 0.5f;
+                var xMax = cx + w * 0.5f;
+                var yMax = cy + h * 0.5f;
+
+                SKRectI boundingBox;
+                SKRect boundingBoxUnscaled;
+
+                if (_yoloCore.YoloOptions.ImageResize == ImageResize.Proportional)
+                {
+                    var scaledXMin = xMin * _modelInputWidth - xPad;
+                    var scaledYMin = yMin * _modelInputHeight - yPad;
+                    var scaledXMax = xMax * _modelInputWidth - xPad;
+                    var scaledYMax = yMax * _modelInputHeight - yPad;
+
+                    boundingBox = ClampBox(
+                        scaledXMin * xGain,
+                        scaledYMin * xGain,
+                        scaledXMax * xGain,
+                        scaledYMax * xGain,
+                        imageSize);
+                    boundingBoxUnscaled = new SKRect(scaledXMin, scaledYMin, scaledXMax, scaledYMax);
+                }
+                else
+                {
+                    boundingBox = ClampBox(
+                        xMin * imageSize.Width,
+                        yMin * imageSize.Height,
+                        xMax * imageSize.Width,
+                        yMax * imageSize.Height,
+                        imageSize);
+                    boundingBoxUnscaled = new SKRect(
+                        xMin * _modelInputWidth,
+                        yMin * _modelInputHeight,
+                        xMax * _modelInputWidth,
+                        yMax * _modelInputHeight);
+                }
+
+                resultBuffer[validBoxCount++] = new ObjectResult
+                {
+                    Label = _labels[mappedLabelIndex],
+                    Confidence = candidateConfidence,
+                    BoundingBox = boundingBox,
+                    BoundingBoxUnscaled = boundingBoxUnscaled,
+                    BoundingBoxIndex = prediction
+                };
+            }
+
+            return validBoxCount;
         }
 
         private (int[] TopIndices, float[] TopScores) GetTopKBuffers(int size)
@@ -215,26 +166,6 @@ namespace YoloDotNet.Modules.RFDETR
             }
 
             return (_topIndices, _topScores);
-        }
-
-        private static void SortTopKDescending(int[] indices, float[] scores, int length)
-        {
-            for (var i = 1; i < length; i++)
-            {
-                var score = scores[i];
-                var index = indices[i];
-                var j = i - 1;
-
-                while (j >= 0 && scores[j] < score)
-                {
-                    scores[j + 1] = scores[j];
-                    indices[j + 1] = indices[j];
-                    j--;
-                }
-
-                scores[j + 1] = score;
-                indices[j + 1] = index;
-            }
         }
 
         private int MapLabelIndex(int labelIndex)
