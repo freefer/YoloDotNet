@@ -36,8 +36,8 @@ namespace RFDETRNanoDemo
             SetDrawingOptions();
 
             var runSegmentation = true;
-            var modelPath = Path.Join(SharedConfig.ModelsFolder,  "fabric.defects.seg.coco.v2-segmentation-2026-07-23.onnx");
-            var classNamesPath = Path.Join(SharedConfig.ModelsFolder, "fabric.defects.seg.coco.v2-segmentation-2026-07-23.txt");
+            var modelPath = Path.Join(SharedConfig.ModelsFolder, "de251c-45%.onnx");
+            var classNamesPath = Path.Join(SharedConfig.ModelsFolder, "de251c-45%_class_names.txt");
 
             if (EnsureDemoAssets(modelPath, classNamesPath, true) is false)
                 return;
@@ -66,8 +66,8 @@ namespace RFDETRNanoDemo
                         Precision = TrtPrecision.FP16,
                         BuilderOptimizationLevel = 3,
                         EngineCachePath = _trtEngineCacheFolder,
-                        EngineCachePrefix =    "fabric.defects.seg.coco.v2-segmentation-2026-07-23" ,
-                        Int8CalibrationCacheFile = Path.Join(SharedConfig.AbsoluteAssetsPath, "cache", "fabric.defects.seg.coco.v2-segmentation-2026-07-23.cache"),
+                        EngineCachePrefix = "de251c-45%",
+                        Int8CalibrationCacheFile = Path.Join(SharedConfig.AbsoluteAssetsPath, "cache", "de251c-45%.cache"),
                     },
                     modelType:     ModelType.Segmentation ,
                     modelVersion: ModelVersion.RFDETR,
@@ -80,8 +80,8 @@ namespace RFDETRNanoDemo
                 // classification on ambiguous defects (e.g. "yellowish stain" being misread as
                 // "dragging filth"). Enabling mipmapping fixes the aliasing and matches PIL/
                 // torchvision's higher-quality downscale used by the official rfdetr Python path.
-                SamplingOptions = new(SKFilterMode.Linear, SKMipmapMode.Linear),
-
+                //SamplingOptions = new(SKFilterMode.Linear, SKMipmapMode.Linear),
+                SamplingOptions = new(SKFilterMode.Linear, SKMipmapMode.None) ,
                 // RF-DETR uses ImageNet normalization after scaling RGB values to 0..1.
                 ImageMean = [0.485f, 0.456f, 0.406f],
                 ImageStd = [0.229f, 0.224f, 0.225f]

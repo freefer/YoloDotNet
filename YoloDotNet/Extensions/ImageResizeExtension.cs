@@ -26,10 +26,16 @@ namespace YoloDotNet.Extensions
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static SKSizeI ResizeImageStretched<T>(this T img, SKSamplingOptions samplingOptions, PinnedMemoryBuffer pinnedMemoryBuffer, SKRectI? roi = null)
         {
-            var (image, createdImage) = CreateSourceImage(img, roi);
-
             int modelWidth = pinnedMemoryBuffer.ImageInfo.Width;
             int modelHeight = pinnedMemoryBuffer.ImageInfo.Height;
+
+            // ROI 直接从原图采样到模型输入。先裁出整块再缩放会多两次全分辨率拷贝。
+            if (img is SKBitmap bitmap
+                && TryDrawBitmapStretched(bitmap, roi, pinnedMemoryBuffer.Canvas, samplingOptions, modelWidth, modelHeight, out var sourceSize))
+                return sourceSize;
+
+            var (image, createdImage) = CreateSourceImage(img, roi);
+
             int width = image.Width;
             int height = image.Height;
 
@@ -39,6 +45,31 @@ namespace YoloDotNet.Extensions
                 image.Dispose();
 
             return new SKSizeI(width, height);
+        }
+
+        static bool TryDrawBitmapStretched(
+            SKBitmap bitmap,
+            SKRectI? roi,
+            SKCanvas canvas,
+            SKSamplingOptions samplingOptions,
+            int modelWidth,
+            int modelHeight,
+            out SKSizeI sourceSize)
+        {
+            var source = roi ?? new SKRectI(0, 0, bitmap.Width, bitmap.Height);
+            sourceSize = new SKSizeI(source.Width, source.Height);
+            if (source.Width < 1 || source.Height < 1 || bitmap.GetPixels() == IntPtr.Zero)
+                return false;
+            if (NeedsPyramid(samplingOptions, source.Width, source.Height, modelWidth, modelHeight))
+                return false;
+
+            using var image = SKImage.FromPixels(bitmap.Info, bitmap.GetPixels());
+            canvas.DrawImage(
+                image,
+                new SKRect(source.Left, source.Top, source.Right, source.Bottom),
+                new SKRect(0, 0, modelWidth, modelHeight),
+                samplingOptions);
+            return true;
         }
 
         /// <summary>

@@ -21,9 +21,7 @@ namespace YoloDotNet.Modules.RFDETR
         private readonly LabelModel[] _labels;
         private int[] _topIndices = [];
         private float[] _topScores = [];
-        private int[] _maskColumnX0 = [];
-        private int[] _maskColumnX1 = [];
-        private float[] _maskColumnXWeight = [];
+        private Candidate[] _candidates = [];
         private List<Segmentation> _results = default!;
 
         public event EventHandler VideoProgressEvent = delegate { };
@@ -91,7 +89,9 @@ namespace YoloDotNet.Modules.RFDETR
             var (topIndices, topScores) = GetTopKBuffers(_predictions);
             var scoreCount = Math.Min(logitsSpan.Length, _predictions * _totalLabels);
             var topCount = YoloCore.SelectTopIndices(logitsSpan[..scoreCount], _predictions, topIndices, topScores);
-            var validBoxCount = 0;
+            var crop = CreateMaskCrop(imageSize);
+            EnsureCandidates(topCount);
+            var candidateCount = 0;
 
             for (var candidateIndex = 0; candidateIndex < topCount; candidateIndex++)
             {
@@ -159,36 +159,82 @@ namespace YoloDotNet.Modules.RFDETR
                 if (boundingBox.Width <= 0 || boundingBox.Height <= 0)
                     continue;
 
-                resultBuffer[validBoxCount++] = new ObjectResult
-                {
-                    Label = _labels[mappedLabelIndex],
-                    Confidence = candidateConfidence,
-                    BoundingBox = boundingBox,
-                    BoundingBoxUnscaled = boundingBoxUnscaled,
-                    BoundingBoxIndex = prediction,
-                    BitPackedPixelMask = PackMask(masksSpan, prediction * _maskPlaneSize, boundingBox, imageSize)
-                };
+                _candidates[candidateCount++] = new Candidate(
+                    prediction,
+                    mappedLabelIndex,
+                    candidateConfidence,
+                    boundingBox,
+                    boundingBoxUnscaled);
             }
 
-            return validBoxCount;
+            if (candidateCount == 0)
+                return 0;
+
+            // Official RF-DETR keeps a mask pixel when bilinear sampling (align_corners=False) is > 0.
+            // The sample grid is capped so a detection that fills the frame does not add work.
+            var masks = ArrayPool<byte[]>.Shared.Rent(candidateCount);
+            var maskWidths = ArrayPool<int>.Shared.Rent(candidateCount);
+            var maskHeights = ArrayPool<int>.Shared.Rent(candidateCount);
+
+            try
+            {
+                unsafe
+                {
+                    fixed (float* maskBase = masksSpan)
+                    {
+                        var maskAddress = (IntPtr)maskBase;
+                        var maskLength = masksSpan.Length;
+
+                        if (candidateCount == 1)
+                        {
+                            PackCandidate(maskAddress, maskLength, crop, 0, masks, maskWidths, maskHeights);
+                        }
+                        else
+                        {
+                            Parallel.For(0, candidateCount, index =>
+                                PackCandidate(maskAddress, maskLength, crop, index, masks, maskWidths, maskHeights));
+                        }
+                    }
+                }
+
+                for (var i = 0; i < candidateCount; i++)
+                {
+                    var candidate = _candidates[i];
+                    resultBuffer[i] = new ObjectResult
+                    {
+                        Label = _labels[candidate.LabelIndex],
+                        Confidence = candidate.Confidence,
+                        BoundingBox = candidate.Box,
+                        BoundingBoxUnscaled = candidate.Unscaled,
+                        BoundingBoxIndex = candidate.Prediction,
+                        BitPackedPixelMask = masks[i] ?? [],
+                        MaskWidth = maskWidths[i],
+                        MaskHeight = maskHeights[i]
+                    };
+                }
+            }
+            finally
+            {
+                ArrayPool<byte[]>.Shared.Return(masks, clearArray: true);
+                ArrayPool<int>.Shared.Return(maskWidths, clearArray: false);
+                ArrayPool<int>.Shared.Return(maskHeights, clearArray: false);
+            }
+
+            return candidateCount;
         }
 
-        private byte[] PackMask(ReadOnlySpan<float> masksSpan, int maskOffset, SKRectI box, SKSizeI imageSize)
+        private MaskCrop CreateMaskCrop(SKSizeI imageSize)
         {
-            var targetWidth = box.Width;
-            var targetHeight = box.Height;
-
-            if (targetWidth <= 0 || targetHeight <= 0 || _maskWidth <= 0 || _maskHeight <= 0)
-                return [];
-
-            var totalPixels = targetWidth * targetHeight;
-            var packed = new byte[(totalPixels + 7) / 8];
             var cropLeft = 0;
             var cropTop = 0;
             var cropRight = _maskWidth;
             var cropBottom = _maskHeight;
 
-            if (_yoloCore.YoloOptions.ImageResize != ImageResize.Stretched)
+            if (_yoloCore.YoloOptions.ImageResize != ImageResize.Stretched
+                && imageSize.Width > 0
+                && imageSize.Height > 0
+                && _maskWidth > 0
+                && _maskHeight > 0)
             {
                 var scale = MathF.Min((float)_modelInputWidth / imageSize.Width, (float)_modelInputHeight / imageSize.Height);
                 var scaledWidth = (int)(imageSize.Width * scale);
@@ -202,62 +248,149 @@ namespace YoloDotNet.Modules.RFDETR
                 cropBottom = Math.Clamp((int)MathF.Round((padY + scaledHeight) * _maskHeight / _modelInputHeight), cropTop + 1, _maskHeight);
             }
 
-            var cropWidth = cropRight - cropLeft;
-            var cropHeight = cropBottom - cropTop;
-            var xScale = (float)cropWidth / imageSize.Width;
-            var yScale = (float)cropHeight / imageSize.Height;
+            var cropWidth = Math.Max(0, cropRight - cropLeft);
+            var cropHeight = Math.Max(0, cropBottom - cropTop);
+            return new MaskCrop(
+                cropLeft,
+                cropTop,
+                cropWidth,
+                cropHeight,
+                imageSize.Width > 0 ? (float)cropWidth / imageSize.Width : 0,
+                imageSize.Height > 0 ? (float)cropHeight / imageSize.Height : 0);
+        }
 
-            // The X-axis source column (x0/x1/weight) only depends on x, not y, but the mask is
-            // sampled at the box's full original-image pixel resolution (targetWidth x targetHeight).
-            // Precomputing it once instead of per-row avoids redoing the same floor/clamp/subtract
-            // work up to targetHeight times per column, which otherwise dominates for large boxes
-            // on large source images.
-            var (columnX0, columnX1, columnXWeight) = GetMaskColumnBuffers(targetWidth);
-
-            for (var x = 0; x < targetWidth; x++)
+        private void PackCandidate(
+            IntPtr maskAddress,
+            int maskLength,
+            MaskCrop crop,
+            int index,
+            byte[][] masks,
+            int[] maskWidths,
+            int[] maskHeights)
+        {
+            var candidate = _candidates[index];
+            var maskOffset = candidate.Prediction * _maskPlaneSize;
+            if (candidate.Box.Width <= 0
+                || candidate.Box.Height <= 0
+                || crop.Width <= 0
+                || crop.Height <= 0
+                || crop.XScale <= 0
+                || crop.YScale <= 0
+                || maskOffset < 0
+                || _maskPlaneSize <= 0
+                || maskLength < _maskPlaneSize
+                || maskOffset > maskLength - _maskPlaneSize)
             {
-                var absoluteX = box.Left + x;
-                var sourceX = (absoluteX + 0.5f) * xScale - 0.5f;
-                var x0Local = Math.Clamp((int)MathF.Floor(sourceX), 0, cropWidth - 1);
-
-                columnX0[x] = cropLeft + x0Local;
-                columnX1[x] = cropLeft + (x0Local < cropWidth - 1 ? x0Local + 1 : x0Local);
-                columnXWeight[x] = sourceX - x0Local;
+                masks[index] = [];
+                maskWidths[index] = 0;
+                maskHeights[index] = 0;
+                return;
             }
 
-            for (var y = 0; y < targetHeight; y++)
+            int packedWidth;
+            int packedHeight;
+            unsafe
             {
-                var absoluteY = box.Top + y;
-                var sourceY = (absoluteY + 0.5f) * yScale - 0.5f;
-                var y0Local = Math.Clamp((int)MathF.Floor(sourceY), 0, cropHeight - 1);
-                var y1Local = y0Local < cropHeight - 1 ? y0Local + 1 : y0Local;
-                var yWeight = sourceY - y0Local;
-                var row0 = maskOffset + (cropTop + y0Local) * _maskWidth;
-                var row1 = maskOffset + (cropTop + y1Local) * _maskWidth;
-                var targetRow = y * targetWidth;
-
-                for (var x = 0; x < targetWidth; x++)
+                var packed = PackBilinearMask((float*)maskAddress, maskOffset, candidate.Box, crop, out packedWidth, out packedHeight);
+                if (!HasAnyBit(packed))
                 {
-                    var x0 = columnX0[x];
-                    var x1 = columnX1[x];
-                    var xWeight = columnXWeight[x];
-                    var topLeft = masksSpan[row0 + x0];
-                    var topRight = masksSpan[row0 + x1];
-                    var bottomLeft = masksSpan[row1 + x0];
-                    var bottomRight = masksSpan[row1 + x1];
-                    var top = topLeft + (topRight - topLeft) * xWeight;
-                    var bottom = bottomLeft + (bottomRight - bottomLeft) * xWeight;
+                    masks[index] = [];
+                    maskWidths[index] = 0;
+                    maskHeights[index] = 0;
+                    return;
+                }
 
-                    // Official RF-DETR inference thresholds masks at > 0 after optional resize/crop.
-                    if (top + (bottom - top) * yWeight > 0)
+                masks[index] = packed;
+            }
+
+            maskWidths[index] = packedWidth;
+            maskHeights[index] = packedHeight;
+        }
+
+        const int MaxPackedEdge = 384;
+
+        private unsafe byte[] PackBilinearMask(
+            float* masks,
+            int maskOffset,
+            SKRectI box,
+            MaskCrop crop,
+            out int packedWidth,
+            out int packedHeight)
+        {
+            (packedWidth, packedHeight) = PackedSize(box);
+            var stepX = box.Width / (float)packedWidth;
+            var stepY = box.Height / (float)packedHeight;
+            var packed = new byte[(packedWidth * packedHeight + 7) / 8];
+            var pixel = 0;
+
+            fixed (byte* destination = packed)
+            {
+                for (var y = 0; y < packedHeight; y++)
+                {
+                    var rawY = (box.Top + (y + 0.5f) * stepY) * crop.YScale - 0.5f;
+                    if (rawY < 0)
+                        rawY = 0;
+
+                    var y0 = (int)rawY;
+                    if (y0 >= crop.Height)
+                        y0 = crop.Height - 1;
+                    if (y0 < 0)
+                        y0 = 0;
+                    var y1 = y0 < crop.Height - 1 ? y0 + 1 : y0;
+                    var yWeight = y1 == y0 ? 0f : rawY - y0;
+                    var row0 = masks + maskOffset + (crop.Top + y0) * _maskWidth + crop.Left;
+                    var row1 = masks + maskOffset + (crop.Top + y1) * _maskWidth + crop.Left;
+
+                    for (var x = 0; x < packedWidth; x++)
                     {
-                        var pixelIndex = targetRow + x;
-                        packed[pixelIndex >> 3] |= (byte)(1 << (pixelIndex & 0b0111));
+                        var rawX = (box.Left + (x + 0.5f) * stepX) * crop.XScale - 0.5f;
+                        if (rawX < 0)
+                            rawX = 0;
+
+                        var x0 = (int)rawX;
+                        if (x0 >= crop.Width)
+                            x0 = crop.Width - 1;
+                        if (x0 < 0)
+                            x0 = 0;
+                        var x1 = x0 < crop.Width - 1 ? x0 + 1 : x0;
+                        var xWeight = x1 == x0 ? 0f : rawX - x0;
+                        var top = row0[x0] + (row0[x1] - row0[x0]) * xWeight;
+                        var bottom = row1[x0] + (row1[x1] - row1[x0]) * xWeight;
+                        if (top + (bottom - top) * yWeight <= 0)
+                            continue;
+
+                        var index = pixel + x;
+                        destination[index >> 3] |= (byte)(1 << (index & 7));
                     }
+
+                    pixel += packedWidth;
                 }
             }
 
             return packed;
+        }
+
+        private static (int Width, int Height) PackedSize(SKRectI box)
+        {
+            var longest = Math.Max(box.Width, box.Height);
+            if (longest <= MaxPackedEdge)
+                return (box.Width, box.Height);
+
+            var scale = MaxPackedEdge / (float)longest;
+            return (
+                Math.Max(1, (int)MathF.Round(box.Width * scale)),
+                Math.Max(1, (int)MathF.Round(box.Height * scale)));
+        }
+
+        private static bool HasAnyBit(byte[] packed)
+        {
+            foreach (var value in packed)
+            {
+                if (value != 0)
+                    return true;
+            }
+
+            return false;
         }
 
         private (int[] TopIndices, float[] TopScores) GetTopKBuffers(int size)
@@ -271,16 +404,10 @@ namespace YoloDotNet.Modules.RFDETR
             return (_topIndices, _topScores);
         }
 
-        private (int[] ColumnX0, int[] ColumnX1, float[] ColumnXWeight) GetMaskColumnBuffers(int size)
+        private void EnsureCandidates(int size)
         {
-            if (_maskColumnX0.Length < size)
-            {
-                _maskColumnX0 = new int[size];
-                _maskColumnX1 = new int[size];
-                _maskColumnXWeight = new float[size];
-            }
-
-            return (_maskColumnX0, _maskColumnX1, _maskColumnXWeight);
+            if (_candidates.Length < size)
+                _candidates = new Candidate[size];
         }
 
         private int MapLabelIndex(int labelIndex)
@@ -301,6 +428,36 @@ namespace YoloDotNet.Modules.RFDETR
             var bottom = Math.Clamp((int)yMax, 0, imageSize.Height - 1);
 
             return new SKRectI(left, top, right, bottom);
+        }
+
+        private readonly struct Candidate(
+            int prediction,
+            int labelIndex,
+            float confidence,
+            SKRectI box,
+            SKRect unscaled)
+        {
+            public readonly int Prediction = prediction;
+            public readonly int LabelIndex = labelIndex;
+            public readonly float Confidence = confidence;
+            public readonly SKRectI Box = box;
+            public readonly SKRect Unscaled = unscaled;
+        }
+
+        private readonly struct MaskCrop(
+            int left,
+            int top,
+            int width,
+            int height,
+            float xScale,
+            float yScale)
+        {
+            public readonly int Left = left;
+            public readonly int Top = top;
+            public readonly int Width = width;
+            public readonly int Height = height;
+            public readonly float XScale = xScale;
+            public readonly float YScale = yScale;
         }
 
         public void Dispose()
