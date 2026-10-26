@@ -761,6 +761,13 @@ namespace YoloDotNet.Extensions
                 Color = options.FontColor,
                 IsAntialias = true
             };
+            using var textStroke = new SKPaint
+            {
+                Color = SKColors.Black,
+                Style = SKPaintStyle.Stroke,
+                StrokeWidth = Math.Max(2f, options.FontSize / 6f),
+                IsAntialias = true
+            };
 
             var fontSize = options?.EnableDynamicScaling ?? true
                 ? image.CalculateDynamicSize(font.Size)
@@ -778,10 +785,10 @@ namespace YoloDotNet.Extensions
                 font.Size = fontSize;
             }
 
+            textStroke.StrokeWidth = Math.Max(3f, font.Size / 10f);
             var margin = (int)fontSize / 2;
             var labelBoxHeight = (int)fontSize * 2;
             var textOffset = (int)(fontSize + margin) - (margin / 2);
-            var shadowOffset = ImageConfig.SHADOW_OFFSET;
             var labelOffset = (int)borderThickness / 2;
 
             // Label box background paint
@@ -817,7 +824,8 @@ namespace YoloDotNet.Extensions
                 var labelText = LabelText(text, detection.Confidence, options.DrawConfidenceScore);
                 var labelWidth = (int)font.MeasureText(labelText);
 
-                labelBgPaint.Color = boxColor;
+                var labelPlate = HexToRgbaSkia(hex, Math.Max(options.BoundingBoxOpacity, 230));
+                labelBgPaint.Color = labelPlate;
                 boxPaint.Color = boxColor;
 
                 var labelBoxWidth = labelWidth + (margin * 2);
@@ -850,10 +858,7 @@ namespace YoloDotNet.Extensions
                         canvas.DrawRect(labelBackground, labelBgPaint);
                     }
 
-                    // Text shadow
-                    if (options.EnableFontShadow)
-                        canvas.DrawText(labelText, text_x + shadowOffset, text_y + shadowOffset, font, ImageConfig.TextShadowPaint);
-
+                    canvas.DrawText(labelText, text_x, text_y, font, textStroke);
                     canvas.DrawText(labelText, text_x, text_y, font, fontColor);
                 }
 
